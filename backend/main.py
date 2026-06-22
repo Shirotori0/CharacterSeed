@@ -98,6 +98,9 @@ async def create_character(
         # 读取文件内容
         content = await story_file.read()
         user_input = content.decode("utf-8")
+        # 如果同时提供了 description（用户寄语），拼接到文件内容末尾
+        if description:
+            user_input = user_input + "\n\n[额外的角色期望]\n" + description
         input_type = "file"
     elif description:
         user_input = description
@@ -159,6 +162,27 @@ def get_character(character_id: int, db: Session = Depends(get_db)):
     if character is None:
         raise HTTPException(status_code=404, detail="角色不存在")
     return character
+
+
+@app.delete("/api/characters/{character_id}")
+def delete_character(character_id: int, db: Session = Depends(get_db)):
+    """
+    删除角色及其所有关联数据（级联删除）。
+    
+    级联清理顺序：memories → conversations → growth_logs → characters，
+    确保数据库无孤儿记录残留。
+    """
+    result = character_crud.cascade_delete_character(db, character_id)
+    if not result["deleted"]:
+        raise HTTPException(status_code=404, detail="角色不存在")
+    
+    return {
+        "detail": (
+            f"角色「{result['name']}」及 {result['memories_deleted']} 条记忆、"
+            f"{result['conversations_deleted']} 条对话、"
+            f"{result['growth_logs_deleted']} 条成长记录已永久删除"
+        )
+    }
 
 # ==================== Chat Endpoints（Day 2实现） ====================
 

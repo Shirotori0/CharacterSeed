@@ -64,10 +64,41 @@ def update_character(db: Session, character_id: int, **kwargs):
     return db_character
 
 def delete_character(db: Session, character_id: int):
-    """删除角色"""
+    """删除角色（仅删除主记录，不含级联）"""
     db_character = db.query(Character).filter(Character.id == character_id).first()
     if db_character:
         db.delete(db_character)
         db.commit()
         return True
     return False
+
+def cascade_delete_character(db: Session, character_id: int) -> dict:
+    """
+    级联删除角色及其所有关联数据。
+    
+    按顺序删除：memories → conversations → growth_logs → characters，
+    确保无孤儿记录残留。使用 query.delete() 批量删除关联数据，
+    避免逐条加载再 delete 的性能开销。
+    """
+    from backend.models import Memory, Conversation, GrowthLog
+
+    db_character = db.query(Character).filter(Character.id == character_id).first()
+    if not db_character:
+        return {"deleted": False, "name": None}
+
+    name = db_character.name
+
+    # 按子表→主表顺序批量删除
+    mem_count = db.query(Memory).filter(Memory.character_id == character_id).delete()
+    conv_count = db.query(Conversation).filter(Conversation.character_id == character_id).delete()
+    growth_count = db.query(GrowthLog).filter(GrowthLog.character_id == character_id).delete()
+    db.delete(db_character)
+    db.commit()
+
+    return {
+        "deleted": True,
+        "name": name,
+        "memories_deleted": mem_count,
+        "conversations_deleted": conv_count,
+        "growth_logs_deleted": growth_count,
+    }

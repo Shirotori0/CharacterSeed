@@ -33,6 +33,7 @@ import sys
 import os
 import json
 import time
+import html
 from typing import Any, Dict, Optional
 
 # 确保项目根目录在 path 中（本地开发时 streamlit run 的 cwd 是项目根）
@@ -45,6 +46,7 @@ from frontend.api_client import (
     create_character_file,
     get_characters,
     get_character,
+    delete_character,
     send_message,
     trigger_growth,
     get_memories,
@@ -155,6 +157,74 @@ def display_personality_bars(personality_dict: dict, prefix: str = ""):
             st.progress(pct, text=f"{val}/100")
 
 
+# ============================================================
+# Director 摘要解析与 CSS 动画注入
+# ============================================================
+
+def parse_director_summary(director_raw: str | None) -> dict | None:
+    """
+    解析 Director 原始 JSON，提取面向用户的摘要信息。
+
+    返回：
+      {"goal": str, "style": str, "focus_count": int}
+      解析失败时返回 None（兼容低版本数据中 director_raw 为 None 的场景）
+    """
+    if not director_raw:
+        return None
+    try:
+        data = json.loads(director_raw)
+        return {
+            "goal": data.get("goal", "继续对话"),
+            "style": data.get("style", "自然"),
+            "focus_count": len(data.get("focus_memories", [])),
+        }
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return None
+
+
+def _inject_chat_styles():
+    """
+    注入 Director/Actor 分时渐进呈现所需的 CSS 动画。
+
+    设计意图：
+      - .director-card: 蓝色左边框 + 浅蓝背景的摘要卡片，fadeIn 0.35s
+      - .actor-tags.latest: 仅最新消息的 Actor 标签带 0.35s 延迟滑入
+      - 历史消息的标签使用普通淡入（无延迟），保持加载时的一致性
+    """
+    st.markdown(
+        '<style>\n'
+        '.director-card {\n'
+        '    animation: directorFadeIn 0.35s ease-out both;\n'
+        '    border-left: 3px solid #4A90D9;\n'
+        '    background: #f0f7ff;\n'
+        '    padding: 8px 12px;\n'
+        '    border-radius: 4px;\n'
+        '    margin: 8px 0;\n'
+        '    font-size: 0.9em;\n'
+        '    line-height: 1.6;\n'
+        '}\n'
+        '.director-card .d-label {\n'
+        '    color: #888;\n'
+        '}\n'
+        '.actor-tags {\n'
+        '    animation: directorFadeIn 0.3s ease-out both;\n'
+        '}\n'
+        '.actor-tags.latest {\n'
+        '    animation: actorSlideUp 0.45s ease-out 0.35s both;\n'
+        '}\n'
+        '@keyframes directorFadeIn {\n'
+        '    from { opacity: 0; transform: translateY(-6px); }\n'
+        '    to { opacity: 1; transform: translateY(0); }\n'
+        '}\n'
+        '@keyframes actorSlideUp {\n'
+        '    from { opacity: 0; transform: translateY(10px); }\n'
+        '    to { opacity: 1; transform: translateY(0); }\n'
+        '}\n'
+        '</style>',
+        unsafe_allow_html=True,
+    )
+
+
 def render_character_selector(key_prefix: str = "") -> int | None:
     """
     渲染角色下拉选择器并返回选中的 character_id。
@@ -242,6 +312,7 @@ def render_page_create():
     user_input_text = ""
     file_content_bytes = None
     file_name = ""
+    file_wish = ""
 
     # ---- 输入区 ----
     if input_mode == "📝 文本描述":
@@ -269,6 +340,12 @@ def render_page_create():
             # 预览文件前 500 字符
             preview = file_content_bytes.decode("utf-8", errors="replace")[:500]
             st.text_area("📋 文件预览", preview, height=100, disabled=True)
+            # 创建寄语（可选）
+            file_wish = st.text_input(
+                "💬 创建寄语（可选）",
+                placeholder="添加对角色的额外期望... 如「希望她是一个有忧郁气质但内心坚强的角色」",
+                key="create_file_wish",
+            )
 
     # ---- 生成按钮 ----
     # 为何用 button 而非 form_submit_button：
@@ -290,7 +367,7 @@ def render_page_create():
             if input_mode == "📝 文本描述":
                 result = create_character_text(user_input_text.strip())
             else:
-                result = create_character_file(file_content_bytes, file_name)
+                result = create_character_file(file_content_bytes, file_name, description=file_wish.strip())
 
         if result.get("error"):
             st.error(f"❌ 创建失败：{result['detail']}")
@@ -329,9 +406,15 @@ def render_page_create():
         if current_state:
             st.subheader("📍 当前状态")
             cols = st.columns(3)
-            cols[0].metric("位置", current_state.get("location", "未知"))
-            cols[1].metric("活动", current_state.get("activity", "空闲"))
-            cols[2].metric("心情", current_state.get("mood", "平静"))
+            with cols[0]:
+                st.markdown("**位置**")
+                st.caption(current_state.get("location", "未知"))
+            with cols[1]:
+                st.markdown("**活动**")
+                st.caption(current_state.get("activity", "空闲"))
+            with cols[2]:
+                st.markdown("**心情**")
+                st.caption(current_state.get("mood", "平静"))
 
         # 初始记忆
         st.subheader("🧠 初始记忆")
@@ -590,6 +673,7 @@ def render_page_chat():
     """
     st.title("💬 角色对话")
     st.markdown("选择一名角色，开始对话。AI 将通过 Director+Actor 双管线生成角色的反应。")
+    _inject_chat_styles()
 
     # ---- 角色选择 ----
     char_id = render_character_selector(key_prefix="chat")
@@ -623,6 +707,40 @@ def render_page_chat():
             f"🔄 {current_state.get('activity', '空闲')} · "
             f"😊 {current_state.get('mood', '平静')}"
         )
+
+        # ---- 场景上下文卡片（提升沉浸感） ----
+        # 将角色当前的位置、活动、心情与世界设定拼合为一段场景描述，
+        # 使用 st.info 呈现，并附加基于情绪的轻度引导提示。
+        world_setting = char_detail.get("world_setting", "")
+        scene_lines = []
+        if current_state:
+            loc = current_state.get("location", "未知地点")
+            act = current_state.get("activity", "空闲")
+            mood = current_state.get("mood", "平静")
+            scene_lines.append(f"📍 **现在你在：** {loc}")
+            scene_lines.append(f"🕐 **角色状态：** {act} · 心情 {mood}")
+
+        # 世界氛围（截取前 80 字避免卡片过于冗长）
+        if world_setting:
+            brief_world = world_setting[:80].rstrip()
+            if len(world_setting) > 80:
+                brief_world += "…"
+            scene_lines.insert(0, f"🌍 **世界氛围：** {brief_world}")
+
+        # 基于情绪的轻度引导提示
+        mood_guide = {
+            "开心": "她看起来心情不错，聊聊开心事吧 🌟",
+            "悲伤": "她似乎有些低落，温柔地关心一下吧 💙",
+            "愤怒": "她现在有点生气，小心说话哦 🔥",
+            "焦虑": "她有些不安，试着让她放松下来 🤗",
+            "平静": "她很平静，聊聊日常也是好选择 ☕",
+            "激动": "她好像很兴奋，问问发生了什么好事吧 🎉",
+        }
+        mood_val = current_state.get("mood", "") if current_state else ""
+        hint_text = mood_guide.get(mood_val, "试试从她当前的状态切入对话吧 ✨")
+
+        scene_md = "\n\n".join(scene_lines) + f"\n\n💡 **提示：** {hint_text}"
+        st.info(scene_md)
 
     st.divider()
 
@@ -665,19 +783,38 @@ def _render_chat_area(char_id: int, session_id: Optional[int]) -> None:
         st.session_state.chat_history = []
 
     # ---- 渲染对话气泡 ----
-    for msg in st.session_state.chat_history:
+    total_msgs = len(st.session_state.chat_history)
+    for idx, msg in enumerate(st.session_state.chat_history):
+        is_latest_fresh = (idx == total_msgs - 1) and msg.get("is_fresh", False)
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
             if msg["role"] == "assistant":
+                # --- 1. Director 摘要卡片（分时渐进：卡片先淡入） ---
+                director_info = parse_director_summary(msg.get("director_raw"))
+                if director_info:
+                    cls = "director-card" + (" latest" if is_latest_fresh else "")
+                    st.markdown(
+                        f'<div class="{cls}">'
+                        f'  <div style="font-weight:600;color:#4A90D9;margin-bottom:4px;">🧠 角色思考</div>'
+                        f'  <div><span class="d-label">目标：</span>{html.escape(director_info["goal"])}</div>'
+                        f'  <div><span class="d-label">风格：</span>{html.escape(director_info["style"])}</div>'
+                        f'  <div><span class="d-label">关联记忆：</span>{director_info["focus_count"]} 条</div>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                # --- 2. Actor 标签（渐进式延迟淡入） ---
                 tags = []
                 if msg.get("emotion"):
-                    tags.append(f"😶 {msg['emotion']}")
+                    tags.append(f"😶 {html.escape(msg['emotion'])}")
                 if msg.get("expression"):
-                    tags.append(f"🎭 {msg['expression']}")
+                    tags.append(f"🎭 {html.escape(msg['expression'])}")
                 if msg.get("action"):
-                    tags.append(f"🏃 {msg['action']}")
+                    tags.append(f"🏃 {html.escape(msg['action'])}")
                 if tags:
-                    st.caption(" · ".join(tags))
+                    tags_str = " · ".join(tags)
+                    cls = "actor-tags" + (" latest" if is_latest_fresh else "")
+                    st.markdown(f'<div class="{cls}">{tags_str}</div>', unsafe_allow_html=True)
 
     # ---- 消息输入 ----
     user_msg = st.chat_input("输入消息...", key="chat_input_box")
@@ -713,6 +850,7 @@ def _render_chat_area(char_id: int, session_id: Optional[int]) -> None:
                 "director_raw": chat_result.get("director_raw", ""),
                 "actor_raw": chat_result.get("actor_raw", ""),
                 "timestamp": str(chat_result.get("timestamp", "")),
+                "is_fresh": True,
             })
 
             # 展示 LLM 原始响应（折叠）
@@ -773,6 +911,41 @@ def _render_chat_area(char_id: int, session_id: Optional[int]) -> None:
                         st.json(json.loads(growth_result["growth_raw"]))
                     except json.JSONDecodeError:
                         st.text(growth_result["growth_raw"])
+
+    # ---- 角色删除（带二次确认） ----
+    st.markdown("---")
+    st.markdown("**⚠️ 危险操作**")
+
+    if st.session_state.get("chat_confirm_delete"):
+        st.warning(
+            f"⚠️ 确定要永久删除角色「{char_detail['name']}」及其所有记忆、"
+            f"对话和成长记录？**此操作不可撤销！**"
+        )
+        col_del_confirm, col_del_cancel = st.columns(2)
+        with col_del_confirm:
+            if st.button("✅ 确认删除", use_container_width=True, key="chat_delete_confirm_btn"):
+                with st.spinner("正在级联删除角色数据..."):
+                    del_result = delete_character(char_id)
+                if del_result.get("error"):
+                    st.error(f"删除失败：{del_result['detail']}")
+                else:
+                    st.success(del_result.get("detail", "删除成功"))
+                    # 清理 session_state
+                    st.session_state.chat_history = []
+                    st.session_state.chat_loaded_char_id = None
+                    if st.session_state.get("selected_character_id") == char_id:
+                        st.session_state.selected_character_id = None
+                    st.session_state.chat_confirm_delete = False
+                    st.cache_data.clear()
+                    st.rerun()
+        with col_del_cancel:
+            if st.button("❌ 取消", use_container_width=True, key="chat_delete_cancel_btn"):
+                st.session_state.chat_confirm_delete = False
+                st.rerun()
+    else:
+        if st.button("🗑️ 删除角色", use_container_width=True, key="chat_delete_btn", type="secondary"):
+            st.session_state.chat_confirm_delete = True
+            st.rerun()
 
 
 # ============================================================
@@ -840,9 +1013,9 @@ def render_page_dashboard():
     with col_right:
         st.subheader("📍 当前状态")
         if current_state:
-            st.metric("位置", current_state.get("location", "未知"))
-            st.metric("活动", current_state.get("activity", "空闲"))
-            st.metric("心情", current_state.get("mood", "平静"))
+            st.markdown(f"**位置:** {current_state.get('location', '未知')}")
+            st.markdown(f"**活动:** {current_state.get('activity', '空闲')}")
+            st.markdown(f"**心情:** {current_state.get('mood', '平静')}")
         else:
             st.info("暂无数据")
 
@@ -855,6 +1028,36 @@ def render_page_dashboard():
                 st.markdown(char_detail["world_setting"])
         if char_detail.get("description"):
             st.caption(f"原始描述: {char_detail['description'][:200]}...")
+
+        # 角色删除（带二次确认）
+        st.markdown("---")
+        if st.session_state.get("dashboard_confirm_delete"):
+            st.warning(
+                f"⚠️ 确定要永久删除角色「{char_detail['name']}」及其所有关联数据？"
+                f"**此操作不可撤销！**"
+            )
+            col_del_cfm, col_del_ccl = st.columns(2)
+            with col_del_cfm:
+                if st.button("✅ 确认删除", use_container_width=True, key="dashboard_delete_confirm_btn"):
+                    with st.spinner("正在级联删除角色数据..."):
+                        del_result = delete_character(char_id)
+                    if del_result.get("error"):
+                        st.error(f"删除失败：{del_result['detail']}")
+                    else:
+                        st.success(del_result.get("detail", "删除成功"))
+                        if st.session_state.get("selected_character_id") == char_id:
+                            st.session_state.selected_character_id = None
+                        st.session_state.dashboard_confirm_delete = False
+                        st.cache_data.clear()
+                        st.rerun()
+            with col_del_ccl:
+                if st.button("❌ 取消", use_container_width=True, key="dashboard_delete_cancel_btn"):
+                    st.session_state.dashboard_confirm_delete = False
+                    st.rerun()
+        else:
+            if st.button("🗑️ 删除角色", use_container_width=True, key="dashboard_delete_btn", type="secondary"):
+                st.session_state.dashboard_confirm_delete = True
+                st.rerun()
 
     st.divider()
 
