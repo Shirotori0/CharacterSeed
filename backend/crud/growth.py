@@ -23,15 +23,20 @@ def create_growth_log(
     personality_delta: Optional[str] = None,
     event_summary: Optional[str] = None,
     new_memories: Optional[str] = None,
-    growth_raw: Optional[str] = None
+    growth_raw: Optional[str] = None,
+    # Day4 新增：事件维度输出
+    schedule_json: Optional[str] = None,
+    world_changes_json: Optional[str] = None,
 ):
-    """创建成长记录"""
+    """创建成长记录（Day4 新增 schedule_json / world_changes_json）"""
     db_growth = GrowthLog(
         character_id=character_id,
         personality_delta=personality_delta,
         event_summary=event_summary,
         new_memories=new_memories,
-        growth_raw=growth_raw
+        growth_raw=growth_raw,
+        schedule_json=schedule_json,
+        world_changes_json=world_changes_json,
     )
     db.add(db_growth)
     db.commit()

@@ -1,6 +1,5 @@
 import json
 import logging
-import re
 import time
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse
@@ -11,6 +10,22 @@ from backend.config import settings
 from backend.services.llm_settings_store import LLMSettingsStore
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_first_balanced_json(text: str) -> str:
+    """从文本中提取第一个平衡的 { ... } JSON 字符串（支持嵌套结构）"""
+    start = text.find("{")
+    if start == -1:
+        return ""
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return ""  # 未闭合
 
 
 class LLMService:
@@ -41,43 +56,81 @@ class LLMService:
           - __init__ 内部（默认）
           - 设置页 PUT 成功后由 main.py 显式调用
             （不显式调用也行——下次 chat 请求时会自动重读）
+
+        Fallback 行为（v2 新增）：
+          当当前激活 provider 的 API Key / base_url / model 任一缺失时，
+          自动遍历全部 6 个 provider，取第一个配置完整的做降级替代。
+          仅所有 provider 都不可用时才抛出 ValueError。
+
+        特别处理：
+          pydantic-settings 读取 .env 但不会将变量导出到 os.environ，
+          而 get_provider_with_env_fallback() 依赖 os.environ 做 env 兜底。
+          因此在此显式 load_dotenv() 确保 .env 变量可被 env fallback 找到。
         """
+        from dotenv import load_dotenv
+        load_dotenv()  # 注入 .env → os.environ，供 get_provider_with_env_fallback 使用
+
+        from backend.services.llm_settings_store import PROVIDER_DEFAULTS
+
         store = LLMSettingsStore()
-        provider_id = store.get_active_provider_id()
-        # get_provider_with_env_fallback 自动从环境变量补齐缺失字段
-        # （向后兼容老的 .env 配置）
-        cfg = store.get_provider_with_env_fallback(provider_id)
+        original_id = store.get_active_provider_id()
 
-        api_key = cfg.get("api_key", "") or ""
-        base_url = cfg.get("base_url", "")
-        model = cfg.get("model", "")
+        # 优先顺序：激活 provider 排第一，其余按默认顺序排列
+        candidates = [original_id] + [
+            pid for pid in PROVIDER_DEFAULTS if pid != original_id
+        ]
 
-        # 校验
-        if not api_key and provider_id != "ollama":
-            raise ValueError(
-                f"provider={provider_id} 的 API Key 为空。"
-                f"请在设置页填写，或在 .env 中设置 {provider_id.upper()}_API_KEY"
+        last_reason = None
+        for pid in candidates:
+            cfg = store.get_provider_with_env_fallback(pid)
+            api_key = cfg.get("api_key", "") or ""
+            base_url = cfg.get("base_url", "")
+            model = cfg.get("model", "")
+
+            # --- 校验配置完整性 ---
+            if pid != "ollama" and not api_key:
+                last_reason = f"provider={pid} 的 API Key 为空"
+                continue
+            if not base_url:
+                last_reason = f"provider={pid} 的 base_url 为空"
+                continue
+            if not model:
+                last_reason = f"provider={pid} 的 model 为空"
+                continue
+            try:
+                self._validate_base_url(base_url)
+            except ValueError as e:
+                last_reason = str(e)
+                continue
+
+            # --- 找到可用 provider ---
+            if pid != original_id:
+                logger.warning(
+                    "LLM provider 降级: %s → %s (model=%s, base_url=%s). "
+                    "原因: %s",
+                    original_id, pid, model, base_url, last_reason,
+                )
+
+            self.provider = pid
+            self.model = model
+            self.base_url = base_url
+            self._api_key = api_key
+            self.client = OpenAI(
+                api_key=api_key if pid != "ollama" else "ollama",
+                base_url=base_url,
+                timeout=self._TIMEOUT,
             )
-        if not base_url:
-            raise ValueError(f"provider={provider_id} 的 base_url 为空")
-        if not model:
-            raise ValueError(f"provider={provider_id} 的 model 为空")
+            self._loaded_at = time.time()
+            logger.info(
+                "LLMService 重新加载: provider=%s, model=%s, base_url=%s",
+                self.provider, self.model, self.base_url,
+            )
+            return
 
-        self._validate_base_url(base_url)
-
-        self.provider = provider_id
-        self.model = model
-        self.base_url = base_url
-        self._api_key = api_key
-        self.client = OpenAI(
-            api_key=api_key if provider_id != "ollama" else "ollama",
-            base_url=base_url,
-            timeout=self._TIMEOUT,
-        )
-        self._loaded_at = time.time()
-        logger.info(
-            "LLMService 重新加载: provider=%s, model=%s, base_url=%s",
-            self.provider, self.model, self.base_url,
+        # 全部 provider 均不可用
+        raise ValueError(
+            f"所有 LLM provider 均未配置完整（最近尝试: {last_reason}）。"
+            "请前往设置页至少配置一个可用的 provider。"
         )
 
     @staticmethod
@@ -275,7 +328,7 @@ class LLMService:
         system_prompt: Optional[str],
         temperature: float,
         max_tokens: int
-    ) -> None:
+        ) -> None:
         """校验调用参数合法性"""
         if not prompt or not isinstance(prompt, str) or not prompt.strip():
             raise ValueError("prompt 必须是非空字符串")
@@ -330,9 +383,27 @@ class LLMService:
 
         return content.strip()
 
+    @staticmethod
+    def _strip_markdown_fence(text: str) -> str:
+        """剥除 ```json ... ``` 或 ``` ... ``` 包裹的 markdown 代码块"""
+        t = text.strip()
+        for fence in ("```json", "```"):
+            if t.startswith(fence):
+                t = t[len(fence):].lstrip("\n\r")
+                if t.endswith("```"):
+                    t = t[:-3].rstrip()
+                break
+        return t
+
     def parse_json_response(self, response: str) -> dict:
         """
         解析LLM的JSON响应
+
+        容错策略（按顺序）：
+          1. 直接 json.loads(清理后的文本)
+          2. 剥除 markdown fence 后重试
+          3. 括号配对提取第一个 { ... } 后解析
+          4. 仍失败则抛出含尾部上下文的异常便于诊断
 
         Args:
             response: LLM返回的字符串
@@ -343,19 +414,33 @@ class LLMService:
         if not response or not isinstance(response, str) or not response.strip():
             raise ValueError("响应为空，无法解析JSON")
 
+        cleaned = self._strip_markdown_fence(response)
+        if not cleaned:
+            raise ValueError("响应经清理后为空，无法解析JSON")
+
+        # --- 尝试 1：直接解析 ---
         try:
-            return json.loads(response.strip())
+            return json.loads(cleaned)
         except json.JSONDecodeError:
             pass
 
-        try:
-            json_match = re.search(r'\{[^}]*\}', response, re.DOTALL)
-            if json_match:
-                return json.loads(json_match.group())
-        except (json.JSONDecodeError, re.error):
-            pass
+        # --- 尝试 2：括号配对提取 ---
+        candidate = _extract_first_balanced_json(cleaned)
+        if candidate:
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                pass
 
-        raise ValueError(f"无法解析LLM响应为JSON: {response[:200]}...")
+        # --- 所有尝试失败：报错时同时显示首部和尾部，便于判断是截断还是格式错误 ---
+        head = response[:120]
+        tail = response[-120:] if len(response) > 240 else ""
+        detail = (
+            f"无法解析LLM响应为JSON（总长度={len(response)}字符）。\n"
+            f"  首部: {head}...\n"
+            f"  尾部: ...{tail}"
+        )
+        raise ValueError(detail)
 
     @staticmethod
     def validate_creation_schema(data: dict) -> dict:
@@ -367,6 +452,9 @@ class LLMService:
         2. personality 子字段：optimism, courage, empathy, loyalty,
            intelligence, sociability（要求为 0-100 整数值）
         3. current_state 子字段：location, activity, mood
+        4. （Day4 新增）可选字段：speaking_style, values, habits, long_term_goal
+        5. （Day5 新增）day1_schedule：Day 1 初始日程数组
+        6. （v1.6 Phase 1 新增）world_name / core_worldview / scenes：世界+场景结构化数据
 
         Args:
             data: 解析后的字典
@@ -413,6 +501,213 @@ class LLMService:
                 current_state[field] = ""
             elif not isinstance(current_state[field], str):
                 current_state[field] = str(current_state[field])
+
+        # Day4 新增：speaking_style / values / habits 字段校验（可选，缺省用默认值）
+        for field, default in [
+            ("speaking_style", ["说话自然"]),
+            ("values", ["追求真实"]),
+            ("habits", ["保持日常作息"]),
+        ]:
+            val = data.get(field)
+            if val is None:
+                data[field] = default
+            elif isinstance(val, list):
+                data[field] = [str(v).strip() for v in val if v and str(v).strip()]
+                if not data[field]:
+                    data[field] = default
+            else:
+                data[field] = default
+
+        long_term_goal = data.get("long_term_goal")
+        if not long_term_goal or not isinstance(long_term_goal, str) or not long_term_goal.strip():
+            data["long_term_goal"] = ""
+        else:
+            data["long_term_goal"] = long_term_goal.strip()
+
+        # -- v1.6 Phase 1 新增：world_name / core_worldview / scenes 校验 --
+        world_name = data.get("world_name")
+        if not world_name or not isinstance(world_name, str) or not world_name.strip():
+            data["world_name"] = data.get("name", "未命名世界") + "的世界"
+        else:
+            data["world_name"] = world_name.strip()
+
+        core_worldview = data.get("core_worldview")
+        if not core_worldview or not isinstance(core_worldview, str) or not core_worldview.strip():
+            data["core_worldview"] = data.get("world_setting", "")[:100]
+        else:
+            data["core_worldview"] = core_worldview.strip()
+
+        # scenes 数组校验
+        scenes_raw = data.get("scenes")
+        if not scenes_raw or not isinstance(scenes_raw, list) or len(scenes_raw) == 0:
+            # 保底：从 world_setting 生成一个最小场景树
+            scenes_raw = [
+                {
+                    "name": data.get("world_name", "世界"),
+                    "scene_layer": "conceptual",
+                    "scene_type": "world",
+                    "parent_index": -1,
+                    "description": data.get("world_setting", ""),
+                },
+                {
+                    "name": current_state.get("location", "未知地点"),
+                    "scene_layer": "actual",
+                    "scene_type": "location",
+                    "parent_index": 0,
+                    "description": f"角色{data.get('name', '')}所在之处",
+                },
+            ]
+
+        validated_scenes = []
+        index_to_id: dict = {}  # 数组索引 → 数据库 ID (占位符，由 main.py 填入)
+
+        for idx, item in enumerate(scenes_raw):
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name", f"场景{idx+1}")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            scene_layer = item.get("scene_layer", "conceptual")
+            if scene_layer not in ("conceptual", "actual"):
+                scene_layer = "conceptual"
+            scene_type = item.get("scene_type", "")
+            if not isinstance(scene_type, str):
+                scene_type = str(scene_type) if scene_type else ""
+            parent_index = item.get("parent_index", -1)
+            try:
+                parent_index = int(parent_index)
+            except (ValueError, TypeError):
+                parent_index = -1
+            # 根场景和概念场景都可以有 parent_index=-1
+            if parent_index < 0:
+                parent_index = -1
+            description = item.get("description", "")
+            if not isinstance(description, str):
+                description = str(description) if description else ""
+
+            validated_scenes.append({
+                "name": name.strip(),
+                "scene_layer": scene_layer,
+                "scene_type": scene_type.strip() or None,
+                "parent_index": parent_index,  # 保存为索引，在 main.py 中解析为 parent_scene_id
+                "description": description.strip(),
+            })
+
+        # 保底：至少 1 概念 + 1 实际
+        has_conceptual = any(s["scene_layer"] == "conceptual" for s in validated_scenes)
+        has_actual = any(s["scene_layer"] == "actual" for s in validated_scenes)
+        if not has_conceptual:
+            validated_scenes.insert(0, {
+                "name": data.get("world_name", "世界"),
+                "scene_layer": "conceptual",
+                "scene_type": "world",
+                "parent_index": -1,
+                "description": data.get("world_setting", ""),
+            })
+        if not has_actual:
+            validated_scenes.append({
+                "name": current_state.get("location", "未知地点"),
+                "scene_layer": "actual",
+                "scene_type": "location",
+                "parent_index": 0,
+                "description": f"角色{data.get('name', '')}所在之处",
+            })
+        data["scenes"] = validated_scenes
+
+        # -- day1_schedule 校验（Day5 新增）：复用 Growth schedule 校验模式 --
+        day1_raw = data.get("day1_schedule")
+        if not day1_raw or not isinstance(day1_raw, list):
+            day1_raw = []
+        validated_day1 = []
+        for idx, item in enumerate(day1_raw):
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content", "")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            event_type = item.get("event_type", "schedule_action")
+            if event_type not in (
+                "schedule_action", "player_dialogue",
+                "scene_event", "character_initiative",
+            ):
+                event_type = "schedule_action"
+            time_period = item.get("time_period", "")
+            if time_period and time_period not in (
+                "morning", "afternoon", "evening", "night",
+            ):
+                time_period = "morning"
+            order_index = item.get("order_index", idx + 1)
+            try:
+                order_index = int(order_index)
+            except (ValueError, TypeError):
+                order_index = idx + 1
+            validated_day1.append({
+                "content": content.strip(),
+                "event_type": event_type,
+                "time_period": time_period or None,
+                "order_index": order_index,
+            })
+
+        # 保底：至少 1 条初始事件
+        if not validated_day1:
+            validated_day1.append({
+                "content": "新的一天开始了",
+                "event_type": "schedule_action",
+                "time_period": None,
+                "order_index": 1,
+            })
+        data["day1_schedule"] = validated_day1
+
+        # -- Step 13 新增：short_term_goals 校验（v1.6 Phase 3） --
+        # 短期目标是 long_term_goal 与 schedule 之间的桥梁，
+        # 每条目标的生命依附于日程事件。
+        goals_raw = data.get("short_term_goals")
+        if not goals_raw or not isinstance(goals_raw, list):
+            goals_raw = []
+
+        validated_goals = []
+        for item in goals_raw:
+            if not isinstance(item, dict):
+                continue
+            goal_text = item.get("goal", "")
+            if not isinstance(goal_text, str) or not goal_text.strip():
+                continue
+            # progress 值域 [0.0, 1.0]，非法值钳位
+            try:
+                progress = float(item.get("progress", 0.0))
+                progress = max(0.0, min(1.0, progress))
+            except (ValueError, TypeError):
+                progress = 0.0
+            # created_day 至少为 1
+            try:
+                created_day = int(item.get("created_day", 1))
+                if created_day < 1:
+                    created_day = 1
+            except (ValueError, TypeError):
+                created_day = 1
+            # source 白名单：creation / growth / character
+            source = item.get("source", "creation")
+            if source not in ("creation", "growth", "character"):
+                source = "creation"
+
+            validated_goals.append({
+                "goal": goal_text.strip(),
+                "progress": progress,
+                "created_day": created_day,
+                "source": source,
+            })
+
+        # 保底：至少 1 条初始短期目标（与长期目标对齐）
+        if not validated_goals:
+            long_term = data.get("long_term_goal", "")
+            fallback_goal = long_term.strip() if long_term.strip() else "探索周围世界，了解自己所处的环境"
+            validated_goals.append({
+                "goal": fallback_goal,
+                "progress": 0.0,
+                "created_day": 1,
+                "source": "creation",
+            })
+        data["short_term_goals"] = validated_goals
 
         return data
 
@@ -608,5 +903,201 @@ class LLMService:
             event_summary = data["event_summary"]
             if not isinstance(event_summary, str) or not event_summary.strip():
                 data["event_summary"] = "角色经历了一次成长"
+
+        return data
+
+    @staticmethod
+    def validate_growth_schema_v2(data: dict) -> dict:
+        """
+        v2 schema 校验：验证 Growth+编剧 LLM 输出的字段与类型（Day4 新增）。
+
+        新增字段（相对于 v1）：
+          - schedule: 次日事件实体数组（必填），每条含 content/event_type/time_period/order_index
+          - world_changes: 世界变化描述（可选，缺省空字符串）
+
+        设计考量（为什么分 v1 和 v2）：
+          保留 v1（validate_growth_schema）保持对旧 Growth 调用的向后兼容；
+          v2 仅由事件推进轴的新 Growth.run() 使用。
+          如果 v2 调用失败，fallback 会尝试用 v1 解析后补默认 schedule。
+        """
+        if not isinstance(data, dict):
+            raise ValueError("数据必须是字典")
+
+        # -- 先走 v1 校验（确保人格 delta/记忆/摘要合法） --
+        try:
+            data = LLMService.validate_growth_schema(data)
+        except ValueError:
+            # v1 校验失败时，仍尝试部分恢复
+            if "personality_delta" not in data or data["personality_delta"] is None:
+                data["personality_delta"] = {}
+            if "new_memories" not in data or data["new_memories"] is None:
+                data["new_memories"] = []
+            if "event_summary" not in data or data["event_summary"] is None:
+                data["event_summary"] = "角色经历了一次成长"
+
+        # -- schedule 校验（v2 新增） --
+        schedule_raw = data.get("schedule")
+        if not schedule_raw or not isinstance(schedule_raw, list):
+            schedule_raw = []
+        validated_schedule = []
+        for idx, item in enumerate(schedule_raw):
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content", "")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            event_type = item.get("event_type", "schedule_action")
+            if event_type not in (
+                "schedule_action", "player_dialogue",
+                "scene_event", "character_initiative",
+            ):
+                event_type = "schedule_action"
+            time_period = item.get("time_period", "")
+            if time_period and time_period not in (
+                "morning", "afternoon", "evening", "night",
+            ):
+                time_period = "morning"
+            order_index = item.get("order_index", idx + 1)
+            try:
+                order_index = int(order_index)
+            except (ValueError, TypeError):
+                order_index = idx + 1
+            validated_schedule.append({
+                "content": content.strip(),
+                "event_type": event_type,
+                "time_period": time_period or None,
+                "order_index": order_index,
+            })
+
+        # schedule 至少保底 1 条
+        if not validated_schedule:
+            validated_schedule.append({
+                "content": "新的一天开始了",
+                "event_type": "schedule_action",
+                "time_period": None,
+                "order_index": 1,
+            })
+        data["schedule"] = validated_schedule
+
+        # -- world_changes 校验 --
+        world_changes = data.get("world_changes", "")
+        if not isinstance(world_changes, str):
+            world_changes = str(world_changes) if world_changes else ""
+        data["world_changes"] = world_changes.strip()
+
+        return data
+
+    # ========================================================================
+    # v1.6 B5：事件模式输出校验函数
+    # ========================================================================
+
+    # Director 事件模式可用能力白名单
+    _VALID_EVENT_CAPABILITIES = {
+        "respond_normally", "initiate_dialogue", "modify_plan",
+    }
+
+    # complete_event 合法子类型（必须带括号前缀）
+    _VALID_COMPLETE_EVENT_SUBTYPES = {
+        "succeed", "exceed", "linger", "fail", "skip",
+    }
+
+    @staticmethod
+    def validate_event_capabilities(capabilities: list) -> list:
+        """
+        校验并清理 Director 事件模式输出的 capabilities 列表。
+
+        校验规则：
+          1. 必须是列表
+          2. 列表中的元素只保留合法的"基础能力"和合法格式的 "complete_event(X)"
+          3. 不含法元素被静默丢弃
+          4. 至少保留 respond_normally + complete_event(succeed) 兜底
+
+        设计考量：
+          - 白名单校验而非黑名单，防止 LLM 幻觉输出非法能力名称
+          - complete_event 子类型枚举限定，防止 LLM 生成 undefined 行为
+          - 静默丢弃而非报错，因为能力选择是"增强"而非"必须"语义
+
+        Args:
+            capabilities: Director 输出的 capabilities 列表
+
+        Returns:
+            清理后的合法能力列表
+        """
+        if not isinstance(capabilities, list):
+            return ["respond_normally", "complete_event(succeed)"]
+
+        cleaned = []
+        for cap in capabilities:
+            if not isinstance(cap, str) or not cap.strip():
+                continue
+            cap = cap.strip()
+
+            # 检查基础能力
+            if cap in LLMService._VALID_EVENT_CAPABILITIES:
+                cleaned.append(cap)
+                continue
+
+            # 检查 complete_event 格式: "complete_event(subtype)"
+            if cap.startswith("complete_event(") and cap.endswith(")"):
+                subtype = cap[len("complete_event("):-1].strip()
+                if subtype in LLMService._VALID_COMPLETE_EVENT_SUBTYPES:
+                    cleaned.append(cap)
+                    continue
+
+            logger.debug("事件能力白名单过滤: 丢弃非法值 '%s'", cap[:60])
+
+        # 兜底：至少保证基础能力存在
+        if not cleaned:
+            cleaned = ["respond_normally", "complete_event(succeed)"]
+
+        # 确保至少有一个 complete_event 子类型
+        has_complete = any(
+            c.startswith("complete_event(") for c in cleaned
+        )
+        if not has_complete:
+            cleaned.append("complete_event(succeed)")
+
+        return cleaned
+
+    @staticmethod
+    def validate_event_actor_output(data: dict) -> dict:
+        """
+        校验 Actor 事件模式输出的必要字段与类型。
+
+        与 validate_actor_schema 的关键区别：
+          - speech 可为 None/空（无对话对象时合法）
+          - action 为必填（主叙事输出）
+          - dialogue_pending 为可选
+
+        Args:
+            data: Actor 输出字典
+
+        Returns:
+            校验通过后的字典
+        """
+        if not isinstance(data, dict):
+            raise ValueError("数据必须是字典")
+
+        # action 必填（事件模式下是主输出）
+        action = data.get("action", "")
+        if not isinstance(action, str) or not action.strip():
+            data["action"] = "按照计划处理了当前事件"
+
+        # expression 必填
+        expression = data.get("expression", "")
+        if not isinstance(expression, str) or not expression.strip():
+            data["expression"] = "表情平静"
+
+        # speech 可选（无对话对象时可为 None 或空字符串）
+        speech = data.get("speech")
+        if speech is not None and (not isinstance(speech, str) or not speech.strip()):
+            speech = None
+        data["speech"] = speech
+
+        # dialogue_pending 可选
+        dialogue_pending = data.get("dialogue_pending")
+        if dialogue_pending is not None and not isinstance(dialogue_pending, dict):
+            dialogue_pending = None
+        data["dialogue_pending"] = dialogue_pending
 
         return data
