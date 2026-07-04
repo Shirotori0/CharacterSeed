@@ -11,6 +11,10 @@ requests==2.31.0
 python-multipart==0.0.6
 aiofiles==23.2.1
 
+# Langfuse LLM 可观测性（可选：未配 KEY 时自动降级为 no-op）
+# 锁版本范围：参考掘金文章踩坑 #4（langfuse>=2.40 对应 langchain>=0.2）
+langfuse>=2.40.0,<3.0.0
+
 # 记忆系统
 # 短期记忆使用纯 Python 实现（deque），无需 LangChain
 # 如需使用 LangChain 高级功能，可取消注释：

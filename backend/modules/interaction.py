@@ -25,6 +25,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from backend.services.llm_service import LLMService
+from backend.services.observability import observe_safe, update_current_trace
 from backend.crud import character as character_crud
 from backend.crud import memory as memory_crud
 from backend.crud import conversation as conversation_crud
@@ -102,6 +103,7 @@ class DirectorModule:
         with open("backend/prompts/director.txt", "r", encoding="utf-8") as f:
             return f.read()
 
+    @observe_safe("director.analyze", as_type="generation")
     def analyze(
         self,
         character_name: str,
@@ -293,6 +295,7 @@ class ActorModule:
         with open("backend/prompts/actor.txt", "r", encoding="utf-8") as f:
             return f.read()
 
+    @observe_safe("actor.generate", as_type="generation")
     def generate(
         self,
         character_name: str,
@@ -719,6 +722,7 @@ class InteractionPipeline:
                 history.append({"role": "assistant", "content": npc_text})
         return history
 
+    @observe_safe("interaction.run", as_type="span")
     def run(
         self,
         character_id: int,
@@ -786,6 +790,24 @@ class InteractionPipeline:
         )
         session_id = session.id
         session_title = session.title
+
+        # ---- 节点 2.6：给 Langfuse 当前 trace 打元数据 ----
+        #   - session_id: 关联到 ChatSession.id，UI 可按会话筛选
+        #   - user_id:    当前是匿名版（"anonymous"），未来接登录后换成实际用户
+        #   - tags:       方便按管线类型筛选
+        update_current_trace(
+            user_id="anonymous",
+            session_id=str(session_id),
+            tags=["interaction", "director+actor", f"character_id={character_id}"],
+            metadata={
+                "character_id": character_id,
+                "character_name": character.name,
+                "session_id": session_id,
+                "session_title": session_title,
+                "history_turns": history_turns,
+                "user_message_length": len(user_message),
+            },
+        )
 
         # ---- 节点 2.5：组装多轮历史消息 ----
         #   从当前 session 取最近 N 轮对话，按时间升序拼接为 OpenAI 风格 messages。

@@ -10,6 +10,17 @@ class Settings(BaseSettings):
     API_V1_STR: str = "/api"
     PROJECT_NAME: str = "CharacterSeed"
 
+    # ============================================================
+    # Langfuse LLM 可观测性（参考掘金文章 https://juejin.cn/post/7633462423300407336）
+    # 全部可选：未设置时 backend/services/observability.py 自动降级为 no-op
+    # ============================================================
+    LANGFUSE_ENABLED: bool = False
+    LANGFUSE_PUBLIC_KEY: Optional[str] = None
+    LANGFUSE_SECRET_KEY: Optional[str] = None
+    LANGFUSE_HOST: str = "https://cloud.langfuse.com"
+    LANGFUSE_SAMPLE_RATE: float = 1.0
+    LANGFUSE_RELEASE: Optional[str] = None
+
     model_config = SettingsConfigDict(
         env_file=".env",
         case_sensitive=True,

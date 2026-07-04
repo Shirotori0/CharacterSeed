@@ -38,6 +38,7 @@ from typing import Dict, Any, List, Optional
 from sqlalchemy.orm import Session
 
 from backend.services.llm_service import LLMService
+from backend.services.observability import observe_safe, update_current_trace
 from backend.crud import character as character_crud
 from backend.crud import memory as memory_crud
 from backend.crud import growth as growth_crud
@@ -197,6 +198,7 @@ class GrowthModule:
             new_personality[dim] = new_val
         return new_personality
 
+    @observe_safe("growth.run", as_type="span")
     def run(
         self,
         character_id: int,
@@ -227,11 +229,27 @@ class GrowthModule:
 
         Raises:
             ValueError: 角色不存在时抛出
+
+        Langfuse: 整个 growth pipeline 是一个 trace span，
+                  内部的 LLM call 由 langfuse.openai 自动记录为 generation 子节点。
         """
         # ---- 节点 1：读取角色当前状态 ----
         character = character_crud.get_character(db, character_id)
         if not character:
             raise ValueError(f"角色不存在: id={character_id}")
+
+        # ---- 节点 1.5：给 Langfuse 当前 trace 打元数据 ----
+        #   - 一次性 attach 角色基础信息，避免后续 LLM 阶段再回查数据库
+        update_current_trace(
+            user_id="anonymous",
+            session_id=f"character:{character_id}",  # growth 没有 chat session，借用 character_id 作 session 维度
+            tags=["growth", f"character_id={character_id}"],
+            metadata={
+                "character_id": character_id,
+                "character_name": character.name,
+                "conversation_limit": conversation_limit,
+            },
+        )
 
         old_personality = self._safe_load_json(character.personality)
         for dim in PERSONALITY_DIMENSIONS:

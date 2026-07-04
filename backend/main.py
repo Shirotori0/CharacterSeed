@@ -60,6 +60,10 @@ from backend.services.llm_settings_store import (
     LLMSettingsStore, PROVIDER_META, PROVIDER_DEFAULTS
 )
 from backend.services import llm_api_tester
+from backend.services.observability import (
+    is_enabled as langfuse_enabled,
+    flush as langfuse_flush,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +92,23 @@ def startup_event():
     print("=" * 50)
     print("CharacterSeed API 启动成功！")
     print("访问 http://localhost:8000/docs 查看API文档")
+    if langfuse_enabled():
+        print("📊 Langfuse tracing: ✅ 已启用")
+    else:
+        print("📊 Langfuse tracing: ⚪ 未启用（在 .env 设置 LANGFUSE_ENABLED=true 开启）")
     print("=" * 50)
+
+
+@app.on_event("shutdown")
+def shutdown_event():
+    """
+    应用关闭时执行。
+    关键：flush Langfuse 待上报的 trace，避免最后几条丢失（文章踩坑 #3）。
+    Langfuse 关闭时该函数是 no-op。
+    """
+    if langfuse_enabled():
+        print("[shutdown] flushing Langfuse traces...")
+        langfuse_flush()
 
 # ==================== Character Endpoints ====================
 
