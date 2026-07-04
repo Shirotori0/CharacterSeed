@@ -33,6 +33,7 @@ import sys
 import os
 import json
 import time
+import html
 from typing import Any, Dict, Optional
 
 # 确保项目根目录在 path 中（本地开发时 streamlit run 的 cwd 是项目根）
@@ -45,6 +46,7 @@ from frontend.api_client import (
     create_character_file,
     get_characters,
     get_character,
+    delete_character,
     send_message,
     trigger_growth,
     get_memories,
@@ -63,6 +65,19 @@ from frontend.api_client import (
     create_session,
     rename_session,
     delete_session,
+    # Day4 事件推进系统
+    advance_event,
+    iterate_day,
+    auto_advance,
+    get_events,
+    # v1.6 Phase 1：世界系统
+    get_world,
+    get_character_world,
+    get_world_scenes,
+    get_character_scenes,
+    get_scene_path,
+    get_scene_changes,
+    get_character_world_changes,
 )
 
 # ============================================================
@@ -155,6 +170,74 @@ def display_personality_bars(personality_dict: dict, prefix: str = ""):
             st.progress(pct, text=f"{val}/100")
 
 
+# ============================================================
+# Director 摘要解析与 CSS 动画注入
+# ============================================================
+
+def parse_director_summary(director_raw: str | None) -> dict | None:
+    """
+    解析 Director 原始 JSON，提取面向用户的摘要信息。
+
+    返回：
+      {"goal": str, "style": str, "focus_count": int}
+      解析失败时返回 None（兼容低版本数据中 director_raw 为 None 的场景）
+    """
+    if not director_raw:
+        return None
+    try:
+        data = json.loads(director_raw)
+        return {
+            "goal": data.get("goal", "继续对话"),
+            "style": data.get("style", "自然"),
+            "focus_count": len(data.get("focus_memories", [])),
+        }
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return None
+
+
+def _inject_chat_styles():
+    """
+    注入 Director/Actor 分时渐进呈现所需的 CSS 动画。
+
+    设计意图：
+      - .director-card: 蓝色左边框 + 浅蓝背景的摘要卡片，fadeIn 0.35s
+      - .actor-tags.latest: 仅最新消息的 Actor 标签带 0.35s 延迟滑入
+      - 历史消息的标签使用普通淡入（无延迟），保持加载时的一致性
+    """
+    st.markdown(
+        '<style>\n'
+        '.director-card {\n'
+        '    animation: directorFadeIn 0.35s ease-out both;\n'
+        '    border-left: 3px solid #4A90D9;\n'
+        '    background: #f0f7ff;\n'
+        '    padding: 8px 12px;\n'
+        '    border-radius: 4px;\n'
+        '    margin: 8px 0;\n'
+        '    font-size: 0.9em;\n'
+        '    line-height: 1.6;\n'
+        '}\n'
+        '.director-card .d-label {\n'
+        '    color: #888;\n'
+        '}\n'
+        '.actor-tags {\n'
+        '    animation: directorFadeIn 0.3s ease-out both;\n'
+        '}\n'
+        '.actor-tags.latest {\n'
+        '    animation: actorSlideUp 0.45s ease-out 0.35s both;\n'
+        '}\n'
+        '@keyframes directorFadeIn {\n'
+        '    from { opacity: 0; transform: translateY(-6px); }\n'
+        '    to { opacity: 1; transform: translateY(0); }\n'
+        '}\n'
+        '@keyframes actorSlideUp {\n'
+        '    from { opacity: 0; transform: translateY(10px); }\n'
+        '    to { opacity: 1; transform: translateY(0); }\n'
+        '}\n'
+        '</style>',
+        unsafe_allow_html=True,
+    )
+
+
 def render_character_selector(key_prefix: str = "") -> int | None:
     """
     渲染角色下拉选择器并返回选中的 character_id。
@@ -242,6 +325,7 @@ def render_page_create():
     user_input_text = ""
     file_content_bytes = None
     file_name = ""
+    file_wish = ""
 
     # ---- 输入区 ----
     if input_mode == "📝 文本描述":
@@ -269,6 +353,12 @@ def render_page_create():
             # 预览文件前 500 字符
             preview = file_content_bytes.decode("utf-8", errors="replace")[:500]
             st.text_area("📋 文件预览", preview, height=100, disabled=True)
+            # 创建寄语（可选）
+            file_wish = st.text_input(
+                "💬 创建寄语（可选）",
+                placeholder="添加对角色的额外期望... 如「希望她是一个有忧郁气质但内心坚强的角色」",
+                key="create_file_wish",
+            )
 
     # ---- 生成按钮 ----
     # 为何用 button 而非 form_submit_button：
@@ -290,7 +380,7 @@ def render_page_create():
             if input_mode == "📝 文本描述":
                 result = create_character_text(user_input_text.strip())
             else:
-                result = create_character_file(file_content_bytes, file_name)
+                result = create_character_file(file_content_bytes, file_name, description=file_wish.strip())
 
         if result.get("error"):
             st.error(f"❌ 创建失败：{result['detail']}")
@@ -329,9 +419,15 @@ def render_page_create():
         if current_state:
             st.subheader("📍 当前状态")
             cols = st.columns(3)
-            cols[0].metric("位置", current_state.get("location", "未知"))
-            cols[1].metric("活动", current_state.get("activity", "空闲"))
-            cols[2].metric("心情", current_state.get("mood", "平静"))
+            with cols[0]:
+                st.markdown("**位置**")
+                st.caption(current_state.get("location", "未知"))
+            with cols[1]:
+                st.markdown("**活动**")
+                st.caption(current_state.get("activity", "空闲"))
+            with cols[2]:
+                st.markdown("**心情**")
+                st.caption(current_state.get("mood", "平静"))
 
         # 初始记忆
         st.subheader("🧠 初始记忆")
@@ -525,7 +621,7 @@ def _render_session_sidebar(char_id: int) -> int:
             if is_active:
                 op_cols = st.columns(2)
                 with op_cols[0]:
-                    with st.popover("✏️ 重命名", use_container_width=True):
+                    with st.expander("✏️ 重命名"):
                         new_title = st.text_input(
                             "新标题", value=title, key=f"rename_input_{sid}",
                             max_chars=200,
@@ -542,7 +638,7 @@ def _render_session_sidebar(char_id: int) -> int:
                                 _refresh_sessions_cache(char_id)
                                 st.rerun()
                 with op_cols[1]:
-                    with st.popover("🗑️ 删除", use_container_width=True):
+                    with st.expander("🗑️ 删除"):
                         st.warning(f"删除 **{title}** 及其全部 {msg_count} 条消息？")
                         if st.button(
                             "确认删除", key=f"delete_confirm_{sid}",
@@ -590,6 +686,7 @@ def render_page_chat():
     """
     st.title("💬 角色对话")
     st.markdown("选择一名角色，开始对话。AI 将通过 Director+Actor 双管线生成角色的反应。")
+    _inject_chat_styles()
 
     # ---- 角色选择 ----
     char_id = render_character_selector(key_prefix="chat")
@@ -624,6 +721,40 @@ def render_page_chat():
             f"😊 {current_state.get('mood', '平静')}"
         )
 
+        # ---- 场景上下文卡片（提升沉浸感） ----
+        # 将角色当前的位置、活动、心情与世界设定拼合为一段场景描述，
+        # 使用 st.info 呈现，并附加基于情绪的轻度引导提示。
+        world_setting = char_detail.get("world_setting", "")
+        scene_lines = []
+        if current_state:
+            loc = current_state.get("location", "未知地点")
+            act = current_state.get("activity", "空闲")
+            mood = current_state.get("mood", "平静")
+            scene_lines.append(f"📍 **现在你在：** {loc}")
+            scene_lines.append(f"🕐 **角色状态：** {act} · 心情 {mood}")
+
+        # 世界氛围（截取前 80 字避免卡片过于冗长）
+        if world_setting:
+            brief_world = world_setting[:80].rstrip()
+            if len(world_setting) > 80:
+                brief_world += "…"
+            scene_lines.insert(0, f"🌍 **世界氛围：** {brief_world}")
+
+        # 基于情绪的轻度引导提示
+        mood_guide = {
+            "开心": "她看起来心情不错，聊聊开心事吧 🌟",
+            "悲伤": "她似乎有些低落，温柔地关心一下吧 💙",
+            "愤怒": "她现在有点生气，小心说话哦 🔥",
+            "焦虑": "她有些不安，试着让她放松下来 🤗",
+            "平静": "她很平静，聊聊日常也是好选择 ☕",
+            "激动": "她好像很兴奋，问问发生了什么好事吧 🎉",
+        }
+        mood_val = current_state.get("mood", "") if current_state else ""
+        hint_text = mood_guide.get(mood_val, "试试从她当前的状态切入对话吧 ✨")
+
+        scene_md = "\n\n".join(scene_lines) + f"\n\n💡 **提示：** {hint_text}"
+        st.info(scene_md)
+
     st.divider()
 
     # ---- 角色切换检测：清空 session 缓存 + 重置激活 session ----
@@ -640,12 +771,71 @@ def render_page_chat():
     with sidebar_col:
         active_sid = _render_session_sidebar(char_id)
     with chat_col:
-        # 渲染当前 session 的标题 + 消息 + 输入
+        # 渲染当前 session 的标题 + 消息（chat_input 必须在 columns 外部）
         _render_chat_area(char_id, active_sid)
+
+    # ---- 消息输入（st.chat_input 不能放在 st.columns 内部） ----
+    if active_sid is not None:
+        user_msg = st.chat_input("输入消息...", key="chat_input_box")
+
+        if user_msg:
+            # 追加用户消息到历史
+            st.session_state.chat_history.append({
+                "role": "user",
+                "content": user_msg,
+            })
+
+            # 调用后端对话 API（带 session_id）
+            with st.spinner("💭 角色正在思考..."):
+                chat_result = send_message(char_id, user_msg, session_id=active_sid)
+
+            if chat_result.get("error"):
+                st.error(f"对话失败：{chat_result['detail']}")
+                st.session_state.chat_history.pop()
+            else:
+                # 同步后端返回的 session_id / session_title
+                new_sid = chat_result.get("session_id") or active_sid
+                new_title = chat_result.get("session_title") or st.session_state.get("current_session_title", "新对话")
+                st.session_state.current_session_id = new_sid
+                st.session_state.current_session_title = new_title
+                st.session_state.chat_loaded_session_id = new_sid
+
+                st.session_state.chat_history.append({
+                    "role": "assistant",
+                    "content": chat_result.get("npc_response", ""),
+                    "emotion": chat_result.get("emotion", ""),
+                    "action": chat_result.get("action", ""),
+                    "expression": chat_result.get("expression", ""),
+                    "director_raw": chat_result.get("director_raw", ""),
+                    "actor_raw": chat_result.get("actor_raw", ""),
+                    "timestamp": str(chat_result.get("timestamp", "")),
+                    "is_fresh": True,
+                })
+
+                # 展示 LLM 原始响应（折叠）
+                if chat_result.get("director_raw") or chat_result.get("actor_raw"):
+                    with st.expander("🔍 LLM 管线内部响应 (调试)", expanded=False):
+                        if chat_result.get("director_raw"):
+                            st.markdown("**Director（注意力聚焦）原始输出：**")
+                            try:
+                                st.json(json.loads(chat_result["director_raw"]))
+                            except json.JSONDecodeError:
+                                st.text(chat_result["director_raw"])
+                        if chat_result.get("actor_raw"):
+                            st.markdown("**Actor（行为生成）原始输出：**")
+                            try:
+                                st.json(json.loads(chat_result["actor_raw"]))
+                            except json.JSONDecodeError:
+                                st.text(chat_result["actor_raw"])
+
+                # 刷新侧栏 session 列表（让 updated_at / message_count 立即更新）
+                _refresh_sessions_cache(char_id)
+
+            st.rerun()
 
 
 def _render_chat_area(char_id: int, session_id: Optional[int]) -> None:
-    """右侧对话区：标题 / 气泡列表 / 输入框 / 成长按钮"""
+    """右侧对话区：标题 / 气泡列表 / 推进按钮 / 成长结果（st.chat_input 在 columns 外部）"""
     # ---- 当前会话标题 ----
     title = st.session_state.get("current_session_title") or "（未选择会话）"
     st.markdown(f"#### 📍 {title}")
@@ -665,90 +855,239 @@ def _render_chat_area(char_id: int, session_id: Optional[int]) -> None:
         st.session_state.chat_history = []
 
     # ---- 渲染对话气泡 ----
-    for msg in st.session_state.chat_history:
+    total_msgs = len(st.session_state.chat_history)
+    for idx, msg in enumerate(st.session_state.chat_history):
+        is_latest_fresh = (idx == total_msgs - 1) and msg.get("is_fresh", False)
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
             if msg["role"] == "assistant":
+                # --- 1. Director 摘要卡片（分时渐进：卡片先淡入） ---
+                director_info = parse_director_summary(msg.get("director_raw"))
+                if director_info:
+                    cls = "director-card" + (" latest" if is_latest_fresh else "")
+                    st.markdown(
+                        f'<div class="{cls}">'
+                        f'  <div style="font-weight:600;color:#4A90D9;margin-bottom:4px;">🧠 角色思考</div>'
+                        f'  <div><span class="d-label">目标：</span>{html.escape(director_info["goal"])}</div>'
+                        f'  <div><span class="d-label">风格：</span>{html.escape(director_info["style"])}</div>'
+                        f'  <div><span class="d-label">关联记忆：</span>{director_info["focus_count"]} 条</div>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                # --- 2. Actor 标签（渐进式延迟淡入） ---
                 tags = []
                 if msg.get("emotion"):
-                    tags.append(f"😶 {msg['emotion']}")
+                    tags.append(f"😶 {html.escape(msg['emotion'])}")
                 if msg.get("expression"):
-                    tags.append(f"🎭 {msg['expression']}")
+                    tags.append(f"🎭 {html.escape(msg['expression'])}")
                 if msg.get("action"):
-                    tags.append(f"🏃 {msg['action']}")
+                    tags.append(f"🏃 {html.escape(msg['action'])}")
                 if tags:
-                    st.caption(" · ".join(tags))
+                    tags_str = " · ".join(tags)
+                    cls = "actor-tags" + (" latest" if is_latest_fresh else "")
+                    st.markdown(f'<div class="{cls}">{tags_str}</div>', unsafe_allow_html=True)
 
-    # ---- 消息输入 ----
-    user_msg = st.chat_input("输入消息...", key="chat_input_box")
-
-    if user_msg:
-        # 追加用户消息到历史
-        st.session_state.chat_history.append({
-            "role": "user",
-            "content": user_msg,
-        })
-
-        # 调用后端对话 API（带 session_id）
-        with st.spinner("💭 角色正在思考..."):
-            chat_result = send_message(char_id, user_msg, session_id=session_id)
-
-        if chat_result.get("error"):
-            st.error(f"对话失败：{chat_result['detail']}")
-            st.session_state.chat_history.pop()
-        else:
-            # 同步后端返回的 session_id / session_title
-            new_sid = chat_result.get("session_id") or session_id
-            new_title = chat_result.get("session_title") or title
-            st.session_state.current_session_id = new_sid
-            st.session_state.current_session_title = new_title
-            st.session_state.chat_loaded_session_id = new_sid
-
-            st.session_state.chat_history.append({
-                "role": "assistant",
-                "content": chat_result.get("npc_response", ""),
-                "emotion": chat_result.get("emotion", ""),
-                "action": chat_result.get("action", ""),
-                "expression": chat_result.get("expression", ""),
-                "director_raw": chat_result.get("director_raw", ""),
-                "actor_raw": chat_result.get("actor_raw", ""),
-                "timestamp": str(chat_result.get("timestamp", "")),
-            })
-
-            # 展示 LLM 原始响应（折叠）
-            if chat_result.get("director_raw") or chat_result.get("actor_raw"):
-                with st.expander("🔍 LLM 管线内部响应 (调试)", expanded=False):
-                    if chat_result.get("director_raw"):
-                        st.markdown("**Director（注意力聚焦）原始输出：**")
-                        try:
-                            st.json(json.loads(chat_result["director_raw"]))
-                        except json.JSONDecodeError:
-                            st.text(chat_result["director_raw"])
-                    if chat_result.get("actor_raw"):
-                        st.markdown("**Actor（行为生成）原始输出：**")
-                        try:
-                            st.json(json.loads(chat_result["actor_raw"]))
-                        except json.JSONDecodeError:
-                            st.text(chat_result["actor_raw"])
-
-            # 刷新侧栏 session 列表（让 updated_at / message_count 立即更新）
-            _refresh_sessions_cache(char_id)
-
-        st.rerun()
-
-    # ---- 侧边操作 ----
+    # ---- 事件列表展示（Day5 新增） ----
     st.divider()
-    if st.button("🌱 触发角色成长", use_container_width=True, key="chat_growth_btn"):
-        with st.spinner("⏳ Growth LLM 正在分析角色成长..."):
-            growth_result = trigger_growth(char_id)
+    st.markdown("##### 📅 事件推进系统")
 
-        if growth_result.get("error"):
-            st.error(f"成长触发失败：{growth_result['detail']}")
+    events = get_events(char_id)
+    character = get_character(char_id)
+    current_day = character.get("day_number", 1) if not character.get("error") else 1
+
+    # ---- v1.6.fix：展示当前场景上下文信息 ----
+    # 从角色关联的世界/场景中提取当前场景路径，帮助玩家理解角色身处何地
+    scene_id = character.get("current_scene_id") if not character.get("error") else None
+    if scene_id:
+        with st.expander("🏰 当前场景环境", expanded=False):
+            world_data = get_character_world(char_id)
+            if world_data and not world_data.get("error"):
+                st.caption(f"🌍 世界：{world_data.get('name', '未知')}")
+            # get_scene_path() 返回 List[Dict]（场景面包屑列表），空列表表示路径不存在
+            path_items = get_scene_path(scene_id)
+            if path_items:
+                path_str = " → ".join(
+                    f"**{s.get('name', '?')}**" for s in path_items
+                )
+                st.markdown(f"📍 场景路径：{path_str}")
+                # 最深层的场景描述
+                deepest = path_items[-1]
+                if deepest.get("description"):
+                    st.caption(f"📝 {deepest['description'][:120]}")
+    elif not character.get("error"):
+        st.caption("🏰 角色尚未关联世界场景（通过角色创建生成初始世界）")
+
+    if events:
+        # 按状态分组统计
+        pending = [e for e in events if e.get("status") == "pending" and e.get("day_number") == current_day]
+        completed_today = [e for e in events if e.get("status") == "completed" and e.get("day_number") == current_day]
+
+        # 进度指示
+        total_today = len(pending) + len(completed_today)
+        if total_today > 0:
+            pct = int(len(completed_today) / total_today * 100)
+            st.progress(pct / 100, text=f"Day {current_day} 进度：{len(completed_today)}/{total_today} ({pct}%)")
+
+        # 待办事件
+        if pending:
+            st.caption(f"⏳ 待推进 ({len(pending)} 项)：")
+            for ev in pending:
+                period_tag = f"`[{ev.get('time_period', '')}]`" if ev.get("time_period") else ""
+                ev_type = ev.get("event_type", "")
+                type_icon = {"scene_event": "🌪️", "character_initiative": "💡", "player_dialogue": "💬"}.get(ev_type, "📋")
+                st.markdown(f"- {type_icon} {period_tag} {ev.get('content', '')}")
+
+        # 已完成事件（折叠）
+        if completed_today:
+            with st.expander(f"✅ 已完成 ({len(completed_today)} 项)", expanded=False):
+                for ev in completed_today:
+                    period_tag = f"`[{ev.get('time_period', '')}]`" if ev.get("time_period") else ""
+                    ev_type = ev.get("event_type", "")
+                    type_icon = {"scene_event": "🌪️", "character_initiative": "💡", "player_dialogue": "💬"}.get(ev_type, "📋")
+                    st.markdown(f"- {type_icon} {period_tag} {ev.get('content', '')}")
+                    if ev.get("result_json"):
+                        st.caption(f"&nbsp;&nbsp;&nbsp;&nbsp;↳ {ev['result_json']}")
+    else:
+        st.info("📭 暂无事件。请先通过角色创建生成 Day 1 初始事件，或触发「迭代一天」生成次日事件。")
+
+    st.caption("推进事件 → 完成后触发成长迭代 → 或使用自动模式一键推演")
+
+    col_advance, col_iterate, col_auto = st.columns(3)
+    with col_advance:
+        advance_clicked = st.button(
+            "⏩ 推进事件", use_container_width=True, key="chat_advance_btn",
+            type="primary",
+        )
+    with col_iterate:
+        iterate_clicked = st.button(
+            "🌱 迭代一天", use_container_width=True, key="chat_iterate_btn",
+        )
+    with col_auto:
+        auto_clicked = st.button(
+            "🚀 自动模式", use_container_width=True, key="chat_auto_btn",
+        )
+
+    # ---- 推进事件 ----
+    if advance_clicked:
+        with st.spinner("⏳ 正在推进下一个事件..."):
+            adv_result = advance_event(char_id)
+        if adv_result.get("error"):
+            st.info(f"ℹ️ {adv_result.get('detail', '暂无待推进事件')}")
         else:
-            st.success(f"✅ 成长分析完成！")
-            st.markdown(f"**事件摘要：** {growth_result.get('event_summary', '无')}")
+            st.success(f"✅ 事件推进完成")
 
-            delta_raw = growth_result.get("personality_delta", "{}")
+            # ---- D1 新增：事件叙事面板（Director 决策 + Actor 叙事双层展示） ----
+            st.markdown(f"**📌 事件类型：** `{adv_result.get('event_type', '-')}`")
+            st.markdown(f"**📝 事件描述：** {adv_result.get('content', '-')}")
+
+            # Director 决策卡片
+            emotion = adv_result.get("emotion", "")
+            capabilities_raw = adv_result.get("capabilities_applied", "")
+            director_raw = adv_result.get("director_raw", "")
+            has_director_data = emotion or capabilities_raw or director_raw
+
+            if has_director_data:
+                with st.expander("🧠 角色决策 (Director)", expanded=True):
+                    if emotion:
+                        st.markdown(f"**情绪：** {emotion}")
+                    if capabilities_raw:
+                        try:
+                            caps = json.loads(capabilities_raw)
+                            if isinstance(caps, list):
+                                cap_labels = {
+                                    "respond_normally": "📋 正常完成",
+                                    "initiate_dialogue": "💬 主动对话",
+                                    "modify_plan": "🔧 修改计划",
+                                }
+                                rendered = []
+                                for c in caps:
+                                    if c.startswith("complete_event("):
+                                        subtype = c[len("complete_event("):-1]
+                                        rendered.append(f"🎯 完成事件({subtype})")
+                                    else:
+                                        rendered.append(cap_labels.get(c, c))
+                                st.markdown(f"**能力选择：** {' · '.join(rendered)}")
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                    if director_raw:
+                        try:
+                            director_json = json.loads(director_raw)
+                            goal = director_json.get("goal", "")
+                            attitude = director_json.get("event_attitude", "")
+                            if goal:
+                                st.caption(f"目标：{goal}")
+                            if attitude:
+                                st.caption(f"态度：{attitude}")
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+
+            # Actor 叙事卡片
+            result_json = adv_result.get("result_json", "")
+            expression = adv_result.get("expression", "")
+            actor_raw = adv_result.get("actor_raw", "")
+            has_actor_data = result_json or expression or actor_raw
+
+            if has_actor_data:
+                with st.expander("🎭 角色行为 (Actor)", expanded=True):
+                    if result_json:
+                        st.markdown(f"**行为叙事：**")
+                        st.info(result_json)
+                    if expression:
+                        st.caption(f"表情：{expression}")
+
+            # D2 新增：主动对话提示
+            if capabilities_raw:
+                try:
+                    caps = json.loads(capabilities_raw)
+                    if isinstance(caps, list) and "initiate_dialogue" in caps:
+                        st.warning(
+                            "💬 **角色有话想对你说！** \n\n"
+                            "请在对话区查看角色主动发起的对话内容。"
+                        )
+                        # 自动刷新事件列表
+                        st.rerun()
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            # 调试折叠
+            if director_raw or actor_raw:
+                with st.expander("🔍 LLM 管线原始输出 (调试)", expanded=False):
+                    if director_raw:
+                        st.markdown("**Director 原始响应：**")
+                        try:
+                            st.json(json.loads(director_raw))
+                        except json.JSONDecodeError:
+                            st.text(director_raw)
+                    if actor_raw:
+                        st.markdown("**Actor 原始响应：**")
+                        try:
+                            st.json(json.loads(actor_raw))
+                        except json.JSONDecodeError:
+                            st.text(actor_raw)
+
+            st.caption(f"Day {adv_result.get('day_number', '?')} · 序号 {adv_result.get('order_index', '?')}")
+
+    # ---- 迭代一天 ----
+    if iterate_clicked:
+        with st.spinner("⏳ Growth LLM 正在分析并生成次日事件..."):
+            iterate_result = iterate_day(char_id)
+        if iterate_result.get("error"):
+            st.error(f"迭代失败：{iterate_result['detail']}")
+        else:
+            st.success(f"✅ 迭代完成！进入 Day {iterate_result.get('day_number', '?')}")
+
+            # ---- v1.6.fix：展示当前世界/场景上下文摘要 ----
+            if scene_id:
+                path_items = get_scene_path(scene_id)
+                if path_items:
+                    path_str = " → ".join(
+                        f"{s.get('name', '?')}" for s in path_items
+                    )
+                    st.caption(f"🏰 当前世界位置：{path_str}")
+
+            # 人格变化
+            delta_raw = iterate_result.get("personality_delta", "{}")
             delta = safe_parse_json(delta_raw)
             if delta:
                 st.markdown("**人格变化 (Δ)：**")
@@ -759,20 +1098,141 @@ def _render_chat_area(char_id: int, session_id: Optional[int]) -> None:
                         color = "green" if dv > 0 else "red"
                         st.markdown(f"  {cn_name}: :{color}[{arrow}{abs(dv)}]")
 
-            new_memories_raw = growth_result.get("new_memories", "[]")
+            # 新增记忆
+            new_memories_raw = iterate_result.get("new_memories", "[]")
             new_memories = safe_parse_json(new_memories_raw) if isinstance(new_memories_raw, str) else new_memories_raw
             if new_memories:
-                with st.expander("🧠 新增记忆", expanded=True):
+                with st.expander("🧠 新增记忆", expanded=False):
                     for nm in new_memories:
                         if isinstance(nm, dict):
                             st.markdown(f"- [{nm.get('importance', 5)}/10] {nm.get('content', '')}")
 
-            if growth_result.get("growth_raw"):
+            # 世界变化
+            wc_raw = iterate_result.get("world_changes_json")
+            if wc_raw:
+                wc = safe_parse_json(wc_raw) if isinstance(wc_raw, str) else wc_raw
+                if isinstance(wc, dict) and wc.get("description"):
+                    st.markdown(f"**🌍 世界变化：** {wc['description']}")
+
+            # 事件摘要
+            if iterate_result.get("event_summary"):
+                st.markdown(f"**📝 事件摘要：** {iterate_result['event_summary']}")
+
+            # 次日日程
+            sched_raw = iterate_result.get("schedule_json", "[]")
+            schedule = safe_parse_json(sched_raw) if isinstance(sched_raw, str) else sched_raw
+            if schedule:
+                st.markdown(f"**📋 次日日程（{iterate_result.get('events_created', 0)} 项）：**")
+                for item in schedule:
+                    if isinstance(item, dict):
+                        period = f"[{item.get('time_period', '')}]" if item.get('time_period') else ""
+                        st.markdown(f"  {period} {item.get('content', '')}")
+
+            if iterate_result.get("growth_raw"):
                 with st.expander("🔍 Growth LLM 原始响应", expanded=False):
                     try:
-                        st.json(json.loads(growth_result["growth_raw"]))
+                        st.json(json.loads(iterate_result["growth_raw"]))
                     except json.JSONDecodeError:
+                        st.text(iterate_result["growth_raw"])
+
+    # ---- 自动模式 ----
+    if auto_clicked:
+        with st.spinner("⏳ 正在自动推进全部事件并迭代..."):
+            auto_result = auto_advance(char_id)
+        if auto_result.get("error"):
+            st.error(f"自动模式失败：{auto_result['detail']}")
+        else:
+            completed = auto_result.get("completed_events", [])
+            st.success(f"✅ 自动模式完成！推进了 {len(completed)} 个事件")
+            if completed:
+                with st.expander(f"📋 已完成事件（{len(completed)} 项）", expanded=False):
+                    for ev in completed:
+                        if isinstance(ev, dict):
+                            st.markdown(f"- [{ev.get('event_type', '?')}] {ev.get('content', '')[:80]}")
+
+            iterate_res = auto_result.get("iterate_result")
+            if iterate_res:
+                st.markdown(f"**进入 Day {iterate_res.get('day_number', '?')}**")
+                delta_raw = iterate_res.get("personality_delta", "{}")
+                delta = safe_parse_json(delta_raw)
+                if delta:
+                    st.markdown("**人格变化 (Δ)：**")
+                    for key, cn_name in PERSONALITY_DIMS:
+                        dv = delta.get(key, 0)
+                        if dv != 0:
+                            arrow = "↑" if dv > 0 else "↓"
+                            color = "green" if dv > 0 else "red"
+                            st.markdown(f"  {cn_name}: :{color}[{arrow}{abs(dv)}]")
+
+            if auto_result.get("error"):
+                st.warning(f"⚠️ {auto_result['error']}")
+
+    # ---- 旧版成长触发（保留向后兼容） ----
+    with st.expander("🌱 旧版成长触发（向后兼容）", expanded=False):
+        if st.button("触发成长", use_container_width=True, key="chat_growth_btn_legacy"):
+            with st.spinner("⏳ Growth LLM 正在分析角色成长..."):
+                growth_result = trigger_growth(char_id)
+            if growth_result.get("error"):
+                st.error(f"成长触发失败：{growth_result['detail']}")
+            else:
+                st.success("成长分析完成！")
+
+                delta_raw = growth_result.get("personality_delta", "{}")
+                delta = safe_parse_json(delta_raw)
+                if delta:
+                    st.markdown("**人格变化 (Δ)：**")
+                    for key, cn_name in PERSONALITY_DIMS:
+                        dv = delta.get(key, 0)
+                        if dv != 0:
+                            arrow = "↑" if dv > 0 else "↓"
+                            color = "green" if dv > 0 else "red"
+                            st.markdown(f"  {cn_name}: :{color}[{arrow}{abs(dv)}]")
+
+                new_memories_raw = growth_result.get("new_memories", "[]")
+                new_memories = safe_parse_json(new_memories_raw) if isinstance(new_memories_raw, str) else new_memories_raw
+                if new_memories:
+                    with st.expander("🧠 新增记忆", expanded=True):
+                        for nm in new_memories:
+                            st.markdown(f"- [{nm.get('importance', 5)}/10] {nm.get('content', '')}")
+
+                if growth_result.get("growth_raw"):
+                    with st.expander("🔍 Growth LLM 原始响应", expanded=False):
                         st.text(growth_result["growth_raw"])
+
+    # ---- 角色删除（带二次确认） ----
+    st.markdown("---")
+    st.markdown("**⚠️ 危险操作**")
+
+    if st.session_state.get("chat_confirm_delete"):
+        st.warning(
+            f"⚠️ 确定要永久删除角色「{char_detail['name']}」及其所有记忆、"
+            f"对话和成长记录？**此操作不可撤销！**"
+        )
+        col_del_confirm, col_del_cancel = st.columns(2)
+        with col_del_confirm:
+            if st.button("✅ 确认删除", use_container_width=True, key="chat_delete_confirm_btn"):
+                with st.spinner("正在级联删除角色数据..."):
+                    del_result = delete_character(char_id)
+                if del_result.get("error"):
+                    st.error(f"删除失败：{del_result['detail']}")
+                else:
+                    st.success(del_result.get("detail", "删除成功"))
+                    # 清理 session_state
+                    st.session_state.chat_history = []
+                    st.session_state.chat_loaded_char_id = None
+                    if st.session_state.get("selected_character_id") == char_id:
+                        st.session_state.selected_character_id = None
+                    st.session_state.chat_confirm_delete = False
+                    st.cache_data.clear()
+                    st.rerun()
+        with col_del_cancel:
+            if st.button("❌ 取消", use_container_width=True, key="chat_delete_cancel_btn"):
+                st.session_state.chat_confirm_delete = False
+                st.rerun()
+    else:
+        if st.button("🗑️ 删除角色", use_container_width=True, key="chat_delete_btn", type="secondary"):
+            st.session_state.chat_confirm_delete = True
+            st.rerun()
 
 
 # ============================================================
@@ -840,9 +1300,9 @@ def render_page_dashboard():
     with col_right:
         st.subheader("📍 当前状态")
         if current_state:
-            st.metric("位置", current_state.get("location", "未知"))
-            st.metric("活动", current_state.get("activity", "空闲"))
-            st.metric("心情", current_state.get("mood", "平静"))
+            st.markdown(f"**位置:** {current_state.get('location', '未知')}")
+            st.markdown(f"**活动:** {current_state.get('activity', '空闲')}")
+            st.markdown(f"**心情:** {current_state.get('mood', '平静')}")
         else:
             st.info("暂无数据")
 
@@ -853,8 +1313,79 @@ def render_page_dashboard():
         if char_detail.get("world_setting"):
             with st.expander("🌍 世界设定", expanded=False):
                 st.markdown(char_detail["world_setting"])
+
+        # ---- v1.6 Phase 1：世界与场景信息 ----
+        if char_detail.get("world_id"):
+            with st.expander("🏰 世界与场景", expanded=False):
+                world_data = get_character_world(char_id)
+                if world_data and not world_data.get("error"):
+                    st.markdown(f"**世界名称：** {world_data.get('name', '未知')}")
+                    st.markdown(f"**世界观：** {world_data.get('core_worldview', '暂无')}")
+                else:
+                    st.info("暂未关联世界信息")
+
+                # 场景列表
+                scenes = get_character_scenes(char_id)
+                if scenes:
+                    actual_scenes = [s for s in scenes if s.get("scene_layer") == "actual"]
+                    conceptual_scenes = [s for s in scenes if s.get("scene_layer") == "conceptual"]
+                    if actual_scenes:
+                        st.markdown("**📍 实际场景：**")
+                        for s in actual_scenes:
+                            marker = "🔵" if s.get("id") == char_detail.get("current_scene_id") else "⚪"
+                            st.caption(f"{marker} {s.get('name', '未知')} — {s.get('description', '')[:80]}")
+                    if conceptual_scenes:
+                        st.markdown("**🗺️ 概念场景：**")
+                        for s in conceptual_scenes:
+                            st.caption(f"  🏛️ {s.get('name', '未知')} ({s.get('scene_type', '')})")
+                else:
+                    st.info("暂未关联场景")
+
+                # 世界变化时间轴
+                with st.expander("📜 世界变化时间轴", expanded=False):
+                    changes = get_character_world_changes(char_id, limit=10)
+                    if changes:
+                        for ch in changes:
+                            change_type = "🎭 角色驱动" if ch.get("change_type") == "character_driven" else "🌪️ 外部事件"
+                            st.caption(
+                                f"Day {ch.get('day_number', '?')} | {change_type} | "
+                                f"{ch.get('description', '')[:120]}"
+                            )
+                    else:
+                        st.info("暂无世界变化记录")
+
         if char_detail.get("description"):
             st.caption(f"原始描述: {char_detail['description'][:200]}...")
+
+        # 角色删除（带二次确认）
+        st.markdown("---")
+        if st.session_state.get("dashboard_confirm_delete"):
+            st.warning(
+                f"⚠️ 确定要永久删除角色「{char_detail['name']}」及其所有关联数据？"
+                f"**此操作不可撤销！**"
+            )
+            col_del_cfm, col_del_ccl = st.columns(2)
+            with col_del_cfm:
+                if st.button("✅ 确认删除", use_container_width=True, key="dashboard_delete_confirm_btn"):
+                    with st.spinner("正在级联删除角色数据..."):
+                        del_result = delete_character(char_id)
+                    if del_result.get("error"):
+                        st.error(f"删除失败：{del_result['detail']}")
+                    else:
+                        st.success(del_result.get("detail", "删除成功"))
+                        if st.session_state.get("selected_character_id") == char_id:
+                            st.session_state.selected_character_id = None
+                        st.session_state.dashboard_confirm_delete = False
+                        st.cache_data.clear()
+                        st.rerun()
+            with col_del_ccl:
+                if st.button("❌ 取消", use_container_width=True, key="dashboard_delete_cancel_btn"):
+                    st.session_state.dashboard_confirm_delete = False
+                    st.rerun()
+        else:
+            if st.button("🗑️ 删除角色", use_container_width=True, key="dashboard_delete_btn", type="secondary"):
+                st.session_state.dashboard_confirm_delete = True
+                st.rerun()
 
     st.divider()
 

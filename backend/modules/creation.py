@@ -68,6 +68,7 @@ class CreationModule:
             prompt=prompt,
             system_prompt=system_prompt,
             temperature=0.7,
+            max_tokens=8000,                          # 14字段嵌套JSON约3000~5000tokens（含scenes/day1_schedule数组），2500不足导致截断→json.loads失败
             response_format={"type": "json_object"}  # Creation 需要 JSON 输出
         )
         return raw_response
@@ -102,8 +103,12 @@ class CreationModule:
 
         Returns:
             (parsed_data, raw_response) 元组
-
-        Langfuse: 整个 pipeline 是一个 trace span，下面的 call_llm 是子 generation。
+            parsed_data 包含以下字段（Day4 新增 speaking_style/values/habits/long_term_goal；Day5 新增 day1_schedule）：
+              - name, world_setting, personality, current_state, initial_memories
+              - speaking_style (list[str]), values (list[str]),
+                habits (list[str]), long_term_goal (str)
+              - day1_schedule (list[dict]): Day 1 初始日程，每条含
+                {content, event_type, time_period, order_index}
         """
         # 步骤1：验证输入
         validated_input = self.validate_input(user_input, input_type)
@@ -125,5 +130,10 @@ class CreationModule:
 
         # 步骤4：解析响应
         parsed_data = self.parse_response(raw_response)
-
+        
+        # Day4 新增：确保说话风格/信念/习惯/长期目标有值
+        # 这些字段由 Creation LLM 的 prompt 要求生成，
+        # 但 schema 校验层已提供默认值兜底，此处不再额外处理。
+        # parse_response() 内部的 validate_creation_schema() 已做完整校验。
+        
         return parsed_data, raw_response

@@ -18,7 +18,14 @@ def create_character(
     world_setting: Optional[str] = None,
     personality: Optional[Union[str, dict]] = None,
     current_state: Optional[Union[str, dict]] = None,
-    creation_raw: Optional[str] = None
+    creation_raw: Optional[str] = None,
+    # Day4 新增：人格扩充字段（已由调用方序列化为 JSON 字符串传入）
+    speaking_style: Optional[str] = None,
+    values: Optional[str] = None,
+    habits: Optional[str] = None,
+    long_term_goal: Optional[str] = None,
+    # v1.6 Phase 3 新增：短期目标（JSON 数组字符串）
+    short_term_goals: Optional[str] = None,
 ):
     """
     创建角色
@@ -39,7 +46,14 @@ def create_character(
         world_setting=world_setting,
         personality=personality,
         current_state=current_state,
-        creation_raw=creation_raw
+        creation_raw=creation_raw,
+        # Day4 新增：人格扩充字段
+        speaking_style=speaking_style,
+        values=values,
+        habits=habits,
+        long_term_goal=long_term_goal,
+        # v1.6 Phase 3 新增：短期目标
+        short_term_goals=short_term_goals,
     )
     db.add(db_character)
     db.commit()
@@ -64,10 +78,44 @@ def update_character(db: Session, character_id: int, **kwargs):
     return db_character
 
 def delete_character(db: Session, character_id: int):
-    """删除角色"""
+    """删除角色（仅删除主记录，不含级联）"""
     db_character = db.query(Character).filter(Character.id == character_id).first()
     if db_character:
         db.delete(db_character)
         db.commit()
         return True
     return False
+
+def cascade_delete_character(db: Session, character_id: int) -> dict:
+    """
+    级联删除角色及其所有关联数据。
+    
+    按顺序删除：events → memories → conversations → growth_logs → characters，
+    确保无孤儿记录残留。使用 query.delete() 批量删除关联数据，
+    避免逐条加载再 delete 的性能开销。
+    """
+    from backend.models import Memory, Conversation, GrowthLog, Event
+
+    db_character = db.query(Character).filter(Character.id == character_id).first()
+    if not db_character:
+        return {"deleted": False, "name": None}
+
+    name = db_character.name
+
+    # 按子表→主表顺序批量删除
+    # Day4 新增：events 表级联清理
+    events_count = db.query(Event).filter(Event.character_id == character_id).delete()
+    mem_count = db.query(Memory).filter(Memory.character_id == character_id).delete()
+    conv_count = db.query(Conversation).filter(Conversation.character_id == character_id).delete()
+    growth_count = db.query(GrowthLog).filter(GrowthLog.character_id == character_id).delete()
+    db.delete(db_character)
+    db.commit()
+
+    return {
+        "deleted": True,
+        "name": name,
+        "events_deleted": events_count,
+        "memories_deleted": mem_count,
+        "conversations_deleted": conv_count,
+        "growth_logs_deleted": growth_count,
+    }

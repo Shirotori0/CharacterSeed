@@ -101,27 +101,31 @@ def create_character_text(description: str) -> Dict[str, Any]:
         return {"error": True, "detail": "请求超时，LLM 生成可能耗时过长，请重试"}
 
 
-def create_character_file(file_bytes: bytes, filename: str) -> Dict[str, Any]:
+def create_character_file(file_bytes: bytes, filename: str, description: str = "") -> Dict[str, Any]:
     """
-    通过 TXT 文件上传创建角色。
+    通过 TXT 文件上传创建角色，可选追加用户寄语。
     端点: POST /api/characters/create (multipart/form-data)
 
     Args:
-        file_bytes: 文件内容的字节数据
-        filename: 原始文件名（用于推断 content-type）
+        file_bytes:   文件内容的字节数据
+        filename:     原始文件名（用于推断 content-type）
+        description:  创建寄语（可选），后端会拼接到 TXT 文件内容末尾
 
     Returns:
         成功: CharacterResponse dict
         失败: {"error": True, "detail": "..."}
 
-    为何分离 text 和 file 两个函数而非用一个统一函数：
-      requests 的 data= 和 files= 参数语义不同。
-      Streamlit 的 st.file_uploader 返回 BytesIO，需要额外提取 bytes。
-      两个独立函数让调用方明确知道自己在做什么，避免参数误传。
+    关于 data + files 同时发送：
+      requests 允许 data dict 和 files dict 共存，data 中的字段以 Form 字段
+      发送，files 中的字段以文件上传发送。FastAPI 端同时接收 Form 和 UploadFile。
     """
     try:
+        data = {}
+        if description:
+            data["description"] = description
         response = requests.post(
             _build_url(f"{API_PREFIX}/characters/create"),
+            data=data,
             files={"story_file": (filename, file_bytes, "text/plain")},
             timeout=TIMEOUT_SECONDS,
         )
@@ -174,6 +178,27 @@ def get_character(character_id: int) -> Dict[str, Any]:
         return {"error": True, "detail": "无法连接后端"}
     except requests.Timeout:
         return {"error": True, "detail": "请求超时"}
+
+
+def delete_character(character_id: int) -> Dict[str, Any]:
+    """
+    删除角色及其全部关联数据（级联删除）。
+    端点: DELETE /api/characters/{character_id}
+
+    Returns:
+        成功: {"detail": "角色「xxx」及 N 条记忆、N 条对话、N 条成长记录已永久删除"}
+        失败: {"error": True, "detail": "..."}
+    """
+    try:
+        response = requests.delete(
+            _build_url(f"{API_PREFIX}/characters/{character_id}"),
+            timeout=10,
+        )
+        return _handle_response(response)
+    except requests.ConnectionError:
+        return {"error": True, "detail": "无法连接后端，请确认 uvicorn 已启动"}
+    except requests.Timeout:
+        return {"error": True, "detail": "删除请求超时"}
 
 
 # ============================================================
@@ -768,3 +793,228 @@ def delete_session(session_id: int) -> Dict[str, Any]:
         return {"error": True, "detail": "无法连接后端"}
     except requests.Timeout:
         return {"error": True, "detail": "删除超时"}
+
+
+# ============================================================
+# Event / Time API（Day4 新增：事件推进系统）
+# ============================================================
+
+def advance_event(character_id: int) -> Dict[str, Any]:
+    """
+    推进下一个待处理事件。
+    端点: POST /api/event/advance (JSON body)
+
+    Args:
+        character_id: 角色 ID
+
+    Returns:
+        成功: EventResponse dict
+              {id, character_id, day_number, order_index, event_type,
+               content, metadata_json, result_json, status, session_id,
+               time_period, created_at}
+        失败: {"error": True, "detail": "..."}
+        无待办事件时返回 404（前端据此判断是否可触发 iterate）
+    """
+    try:
+        response = requests.post(
+            _build_url(f"{API_PREFIX}/event/advance"),
+            json={"character_id": character_id},
+            timeout=TIMEOUT_SECONDS,
+        )
+        return _handle_response(response)
+    except requests.ConnectionError:
+        return {"error": True, "detail": "无法连接后端，请确认 uvicorn 已启动"}
+    except requests.Timeout:
+        return {"error": True, "detail": "事件推进请求超时，请重试"}
+
+
+def iterate_day(character_id: int) -> Dict[str, Any]:
+    """
+    触发 Growth 迭代一天（控制台模式）。
+    端点: POST /api/time/iterate (JSON body)
+    """
+    try:
+        response = requests.post(
+            _build_url(f"{API_PREFIX}/time/iterate"),
+            json={"character_id": character_id},
+            timeout=TIMEOUT_SECONDS,
+        )
+        return _handle_response(response)
+    except requests.ConnectionError:
+        return {"error": True, "detail": "无法连接后端"}
+    except requests.Timeout:
+        return {"error": True, "detail": "迭代请求超时，请重试"}
+
+
+def auto_advance(character_id: int) -> Dict[str, Any]:
+    """
+    自动推进全部待处理事件 + 触发迭代（自动模式）。
+    端点: POST /api/time/auto (JSON body)
+    """
+    try:
+        response = requests.post(
+            _build_url(f"{API_PREFIX}/time/auto"),
+            json={"character_id": character_id},
+            timeout=TIMEOUT_SECONDS * 3,
+        )
+        return _handle_response(response)
+    except requests.ConnectionError:
+        return {"error": True, "detail": "无法连接后端"}
+    except requests.Timeout:
+        return {"error": True, "detail": "自动推进请求超时，请重试"}
+
+
+def get_events(character_id: int, day_number: Optional[int] = None) -> List[Dict[str, Any]]:
+    """
+    获取角色的事件列表。
+    端点: GET /api/characters/{character_id}/events?day_number=
+    """
+    params: Dict[str, Any] = {}
+    if day_number is not None:
+        params["day_number"] = day_number
+    try:
+        response = requests.get(
+            _build_url(f"{API_PREFIX}/characters/{character_id}/events"),
+            params=params,
+            timeout=10,
+        )
+        result = _handle_response(response)
+        if isinstance(result, list):
+            return result
+        return []
+    except (requests.ConnectionError, requests.Timeout):
+        return []
+
+
+# ============================================================
+# World / Scene API（v1.6 Phase 1 新增：世界系统）
+# ============================================================
+
+def get_world(world_id: int) -> Dict[str, Any]:
+    """
+    获取世界详情。
+    端点: GET /api/worlds/{world_id}
+    """
+    try:
+        response = requests.get(
+            _build_url(f"{API_PREFIX}/worlds/{world_id}"),
+            timeout=10,
+        )
+        return _handle_response(response)
+    except requests.ConnectionError:
+        return {"error": True, "detail": "无法连接后端"}
+    except requests.Timeout:
+        return {"error": True, "detail": "请求超时"}
+
+
+def get_character_world(character_id: int) -> Dict[str, Any]:
+    """
+    获取角色所属世界。
+    端点: GET /api/characters/{character_id}/world
+    """
+    try:
+        response = requests.get(
+            _build_url(f"{API_PREFIX}/characters/{character_id}/world"),
+            timeout=10,
+        )
+        return _handle_response(response)
+    except requests.ConnectionError:
+        return {"error": True, "detail": "无法连接后端"}
+    except requests.Timeout:
+        return {"error": True, "detail": "请求超时"}
+
+
+def get_world_scenes(world_id: int, scene_layer: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    获取世界下的场景列表。
+    端点: GET /api/worlds/{world_id}/scenes?scene_layer=
+    """
+    params: Dict[str, Any] = {}
+    if scene_layer:
+        params["scene_layer"] = scene_layer
+    try:
+        response = requests.get(
+            _build_url(f"{API_PREFIX}/worlds/{world_id}/scenes"),
+            params=params,
+            timeout=10,
+        )
+        result = _handle_response(response)
+        if isinstance(result, list):
+            return result
+        return []
+    except (requests.ConnectionError, requests.Timeout):
+        return []
+
+
+def get_character_scenes(character_id: int) -> List[Dict[str, Any]]:
+    """
+    获取角色所属世界的全部场景。
+    端点: GET /api/characters/{character_id}/scenes
+    """
+    try:
+        response = requests.get(
+            _build_url(f"{API_PREFIX}/characters/{character_id}/scenes"),
+            timeout=10,
+        )
+        result = _handle_response(response)
+        if isinstance(result, list):
+            return result
+        return []
+    except (requests.ConnectionError, requests.Timeout):
+        return []
+
+
+def get_scene_path(scene_id: int) -> List[Dict[str, Any]]:
+    """
+    获取场景完整路径（面包屑导航）。
+    端点: GET /api/scenes/{scene_id}/path
+    """
+    try:
+        response = requests.get(
+            _build_url(f"{API_PREFIX}/scenes/{scene_id}/path"),
+            timeout=10,
+        )
+        result = _handle_response(response)
+        if isinstance(result, list):
+            return result
+        return []
+    except (requests.ConnectionError, requests.Timeout):
+        return []
+
+
+def get_scene_changes(scene_id: int, limit: int = 20) -> List[Dict[str, Any]]:
+    """
+    获取场景变化历史。
+    端点: GET /api/scenes/{scene_id}/changes?limit=
+    """
+    try:
+        response = requests.get(
+            _build_url(f"{API_PREFIX}/scenes/{scene_id}/changes"),
+            params={"limit": limit},
+            timeout=10,
+        )
+        result = _handle_response(response)
+        if isinstance(result, list):
+            return result
+        return []
+    except (requests.ConnectionError, requests.Timeout):
+        return []
+
+
+def get_character_world_changes(character_id: int, limit: int = 50) -> List[Dict[str, Any]]:
+    """
+    获取角色世界的场景变化时间轴。
+    端点: GET /api/characters/{character_id}/world-changes?limit=
+    """
+    try:
+        response = requests.get(
+            _build_url(f"{API_PREFIX}/characters/{character_id}/world-changes"),
+            params={"limit": limit},
+            timeout=10,
+        )
+        result = _handle_response(response)
+        if isinstance(result, list):
+            return result
+        return []
+    except (requests.ConnectionError, requests.Timeout):
+        return []

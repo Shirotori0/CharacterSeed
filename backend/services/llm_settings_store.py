@@ -36,10 +36,11 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# 路径常量
+# 路径常量（文件仅在用户通过设置页 PUT 保存时创建）
 # ---------------------------------------------------------------------------
-# 存放在 <project_root>/usercontext/llm_settings.json
-# 不放在 backend/ 下面：避免后端代码改动时误删配置
+# 首次启动时不自动创建，所有配置优先从 .env 读取。
+# 用户用过设置页 PUT 后文件才会被 _write() 创建，
+# 此后 _read() 以文件内容为准（不再读 .env）。
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 _SETTINGS_DIR = os.path.join(_PROJECT_ROOT, "usercontext")
 _SETTINGS_FILE = os.path.join(_SETTINGS_DIR, "llm_settings.json")
@@ -170,26 +171,65 @@ class LLMSettingsStore:
 
     # -------------------- 文件 IO --------------------
     def _ensure_loaded(self) -> None:
-        """保证文件存在；不存在则写入默认值。"""
-        with _file_lock:
-            if not os.path.exists(_SETTINGS_FILE):
-                os.makedirs(_SETTINGS_DIR, exist_ok=True)
-                _atomic_write(
-                    _SETTINGS_FILE,
-                    json.dumps(_default_settings(), ensure_ascii=False, indent=2),
-                )
-                logger.info("初始化 LLM 设置文件: %s", _SETTINGS_FILE)
+        """
+        确保配置可读。
+
+        不再自动创建 usercontext/ 目录和 llm_settings.json。
+        文件仅在用户通过设置页 PUT 主动保存时由 _write() 创建。
+        文件不存在时 _read() 自动回退到 .env 构建配置。
+        """
+        pass
 
     def _read(self) -> Dict[str, Any]:
+        """读取配置。文件不存在时从 .env 环境变量构建。"""
+        if not os.path.exists(_SETTINGS_FILE):
+            return self._build_from_env()
         with _file_lock:
             with open(_SETTINGS_FILE, "r", encoding="utf-8") as f:
                 raw = f.read()
         try:
             stored = json.loads(raw) if raw.strip() else {}
         except json.JSONDecodeError:
-            logger.warning("LLM 设置文件损坏，使用默认配置")
-            stored = {}
+            logger.warning("LLM 设置文件损坏，回退到 .env 配置")
+            return self._build_from_env()
         return _merge_defaults(stored)
+
+    @staticmethod
+    def _build_from_env() -> Dict[str, Any]:
+        """
+        从 .env 环境变量构建完整配置（文件不存在时使用）。
+
+        读取规则：
+          - LLM_PROVIDER → 激活的 provider（不设则用默认值 "agnes"）
+          - {PID}_API_KEY / {PID}_BASE_URL / {PID}_MODEL → 各 provider 配置
+            （不设则用 PROVIDER_DEFAULTS 中的默认值）
+        """
+        from dotenv import load_dotenv
+        load_dotenv()
+
+        data = _default_settings()
+
+        # 从 LLM_PROVIDER 读取激活 provider（兼容大小写）
+        env_provider = os.environ.get("LLM_PROVIDER", "").strip().lower()
+        if env_provider in PROVIDER_DEFAULTS:
+            data["active_provider"] = env_provider
+
+        # 为每个 provider 从环境变量读取配置
+        for pid in PROVIDER_DEFAULTS:
+            cfg = data["providers"][pid]
+            prefix = pid.upper()
+            env_key = os.environ.get(f"{prefix}_API_KEY")
+            env_url = os.environ.get(f"{prefix}_BASE_URL")
+            env_model = os.environ.get(f"{prefix}_MODEL")
+            if env_key:
+                cfg["api_key"] = env_key
+            if env_url:
+                cfg["base_url"] = env_url
+            if env_model:
+                cfg["model"] = env_model
+
+        logger.debug("从 .env 构建 LLM 配置: active=%s", data["active_provider"])
+        return data
 
     def _write(self, data: Dict[str, Any]) -> None:
         with _file_lock:

@@ -11,6 +11,7 @@ usercontext/
 refproj/
 
 # ===== 日志 =====
+logs/
 *.log
 backend_stderr.log
 backend_stdout.log
@@ -29,15 +30,37 @@ dist/
 venv/
 TraeAI-*/
 
+# ===== 测试缓存 =====
+.pytest_cache/
+
+# ===== 根目录测试文件（已统一迁移至 tests/，避免根目录残留）=====
+/test_creation.py
+/test_day4.py
+/test_refactored.py
+
+# ===== tests/ 下测试记录文件（统一存储在 records/ 子目录中，避免被 pytest 误收集）=====
+/tests/records/
+
 # ===== IDE / 编辑器 =====
 .idea/
 .vscode/
 *.swp
 *.swo
 
+# ===== AI 辅助工具配置 =====
+.codebuddy/
+
+# ===== 开发脚本（非产品组成部分）=====
+scripts/
+
 # ===== 操作系统 =====
 .DS_Store
 Thumbs.db
 
+# ===== 大型二进制构建产物/压缩包 =====
+doc/初赛/
+doc/路演SSOT/路演
+
 # ===== 临时文档 =====
 doc/todo.md
+doc/ref/

@@ -18,6 +18,7 @@ Day 2 — 交互运行时（Interaction Runtime）
 
 import json
 import logging
+import collections
 from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime
 
@@ -28,6 +29,9 @@ from backend.services.observability import observe_safe, update_current_trace
 from backend.crud import character as character_crud
 from backend.crud import memory as memory_crud
 from backend.crud import conversation as conversation_crud
+from backend.crud import scene as scene_crud           # v1.6: Scene 上下文
+from backend.crud import scene_change as scene_change_crud  # v1.6: 场景变化
+from backend.crud import event as event_crud           # v1.6: 事件上下文
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +53,26 @@ FALLBACK_ACTOR_OUTPUT: Dict[str, Any] = {
     "action": "站在原地，注视着玩家",
     "expression": "表情平静",
     "speech": "（角色暂时无法回应）",
+}
+
+# ============================================================================
+# v1.6 新增：事件模式降级常量
+# 当事件模式 LLM 调用失败时使用，确保管线不崩溃
+# ============================================================================
+
+FALLBACK_DIRECTOR_EVENT_OUTPUT: Dict[str, Any] = {
+    "emotion": "平静",
+    "goal": "完成当前日常安排",
+    "capabilities": ["respond_normally", "complete_event(succeed)"],
+    "event_attitude": "平常心对待这个日常事件",
+    "plan_modifications": [],
+}
+
+FALLBACK_ACTOR_EVENT_OUTPUT: Dict[str, Any] = {
+    "action": "按照日程计划完成了该做的事情",
+    "speech": None,
+    "expression": "表情平静",
+    "dialogue_pending": None,
 }
 
 
@@ -88,6 +112,9 @@ class DirectorModule:
         recent_memories: List[str],
         user_input: str,
         history_messages: Optional[List[Dict[str, str]]] = None,
+        scene_context: Optional[str] = None,  # v1.6 新增：场景结构化上下文
+        event_mode: bool = False,              # v1.6 新增：事件模式标志
+        event_context: Optional[Dict[str, str]] = None,  # v1.6 新增：事件模式附加占位符
     ) -> Tuple[Dict[str, Any], str]:
         """
         执行注意力聚焦分析。
@@ -103,6 +130,11 @@ class DirectorModule:
                 messages 数组会按 [system, ...history, current_user(prompt)] 顺序组装，
                 LLM 能感知完整对话上下文。
                 传 None 或空列表则回退到单轮（system + user）模式。
+            scene_context:   v1.6 新增，结构化场景上下文文本块。
+                为空时 Director 工作在"无坐标"模式（向后兼容）。
+            event_mode:      v1.6 新增，True 时注入事件模式 prompt 区块。
+            event_context:   v1.6 新增，事件模式的附加占位符 dict。
+                包含 {today_full_schedule, event_type, event_content, personality_influence}。
 
         Returns:
             (parsed_data, raw_response) 元组
@@ -126,6 +158,34 @@ class DirectorModule:
             recent_memories=memories_str,
             user_input=user_input,
         )
+
+        # v1.6 新增：注入场景上下文到 Director prompt
+        if scene_context:
+            prompt += "\n\n[场景上下文 - 角色所处的世界环境]\n" + scene_context
+
+        # v1.6 新增：事件模式 prompt 区块注入
+        if event_mode and event_context:
+            ec = event_context
+            event_block = (
+                "\n\n[事件模式 - 角色正在处理一个日程事件]\n"
+                f"今日全部日程（含本事件）：\n{ec.get('today_full_schedule', '(无)')}\n"
+                f"当前正在处理：[{ec.get('event_type', 'schedule_action')}] {ec.get('event_content', '')}\n"
+                f"\n{ec.get('personality_influence', '')}\n"
+                "\n可用能力集合（必须在此集合内选择，可组合多个）：\n"
+                "- respond_normally: 正常完成事件，生成叙事化行为描述\n"
+                "- initiate_dialogue: 主动向玩家发起对话\n"
+                "- modify_plan: 修改当前或今日后续事件\n"
+                "- complete_event: 必须选择以下之一：succeed / exceed / linger / fail / skip\n"
+                "\n请输出严格的 JSON（不要包含 ```json``` 标记）：\n"
+                "{\n"
+                '  "emotion": "角色当前情绪标签",\n'
+                '  "goal": "角色处理此事件时的目标",\n'
+                '  "capabilities": ["respond_normally", "complete_event(succeed)"],\n'
+                '  "event_attitude": "角色对当前事件的态度（一句话）",\n'
+                '  "plan_modifications": []\n'
+                "}"
+            )
+            prompt += event_block
 
         # --- 步骤 2：调用 LLM ---
         # temperature=0.5 的设计考量：
@@ -172,6 +232,9 @@ class DirectorModule:
         recent_memories: List[str],
         user_input: str,
         history_messages: Optional[List[Dict[str, str]]] = None,
+        scene_context: Optional[str] = None,
+        event_mode: bool = False,
+        event_context: Optional[Dict[str, str]] = None,
     ) -> Tuple[Dict[str, Any], Optional[str]]:
         """
         带降级的注意力分析。
@@ -179,23 +242,28 @@ class DirectorModule:
         与 analyze() 的区别：捕获异常后不向上抛，而是返回降级值。
         这是管线中的"安全网"节点，确保 Director 的失败不会阻塞 Actor。
 
-        history_messages 透传给 analyze()，语义与 analyze() 一致。
+        v1.6 新增参数与 analyze() 一致，透传即可。
 
         Returns:
             (parsed_data, raw_response_or_None)
             成功时 raw_response 为 LLM 原始 JSON 字符串
-            降级时 raw_response 为 None
+            降级时 raw_response 为 None（事件模式下降级到 FALLBACK_DIRECTOR_EVENT_OUTPUT）
         """
         try:
             return self.analyze(
                 character_name, personality, current_state,
                 recent_memories, user_input,
                 history_messages=history_messages,
+                scene_context=scene_context,
+                event_mode=event_mode,
+                event_context=event_context,
             )
         except Exception as e:
             logger.warning(
                 "Director LLM 调用失败，使用降级输出: %s", e
             )
+            if event_mode:
+                return dict(FALLBACK_DIRECTOR_EVENT_OUTPUT), None
             return dict(FALLBACK_DIRECTOR_OUTPUT), None
 
 
@@ -238,6 +306,8 @@ class ActorModule:
         style: str,
         user_input: str,
         history_messages: Optional[List[Dict[str, str]]] = None,
+        event_mode: bool = False,  # v1.6 新增：事件模式标志
+        scene_context: Optional[str] = None,  # v1.6.fix 新增：场景上下文
     ) -> Tuple[Dict[str, Any], str]:
         """
         生成角色行为（动作 + 表情 + 语言）。
@@ -251,15 +321,13 @@ class ActorModule:
             style:           Director 确定的回复风格
             user_input:      玩家输入文本
             history_messages: 可选的历史对话消息列表。
-                传入时启用多轮模式 ——
-                messages 数组会按 [system, ...history, current_user(prompt)] 顺序组装，
-                让 LLM 在生成回复时能感知到完整对话上下文（不仅是 Director 提供的摘要）。
-                传 None 或空列表则回退到单轮（system + user）模式。
+            event_mode:      v1.6 新增，True 时注入事件模式约束区块。
+            scene_context:   v1.6.fix 新增，场景上下文文本。
+                让 Actor 生成行为时感知角色所处环境，
+                产出的 action 能自然地融入场景元素。
 
         Returns:
             (parsed_data, raw_response) 元组
-            - parsed_data: 校验通过后的字典 {action, expression, speech}
-            - raw_response: LLM 原始 JSON 字符串
 
         降级策略：
             LLM 调用异常 → 返回 FALLBACK_ACTOR_OUTPUT + 错误日志
@@ -270,9 +338,6 @@ class ActorModule:
             f"  - {mem}" for mem in (focus_memories or [])
         ) or "  （无特殊关注的记忆）"
 
-        # 注意：prompt 模板使用 {} 占位符但 Director 输出中可能含 {}，
-        # 故使用 format_map + defaultdict 的安全替换方式，避免 KeyError
-        import collections
         safe_dict = collections.defaultdict(str, {
             "character_name": character_name,
             "personality": personality_str,
@@ -281,12 +346,30 @@ class ActorModule:
             "goal": goal,
             "style": style,
             "user_input": user_input,
+            "scene_context": scene_context or "  （暂无场景信息）",  # v1.6.fix
         })
 
         # 使用 string.Template 风格安全性建 prompt
         prompt = self.prompt_template
         for key, val in safe_dict.items():
             prompt = prompt.replace("{" + key + "}", val)
+
+        # v1.6 新增：事件模式约束区块注入
+        if event_mode:
+            prompt += (
+                "\n\n[事件模式约束]\n"
+                "- speech 可为 null（当无对话对象时）\n"
+                "- action 承担主要叙事输出，描述事件执行的具体过程\n"
+                "- dialogue_pending 仅当 Director 选择 initiate_dialogue 时存在\n"
+                "- expression 描述角色执行事件时的表情\n"
+                "\n请输出严格的 JSON（不要包含 ```json``` 标记）：\n"
+                "{\n"
+                '  "action": "第三人称叙事描述，角色如何处理该事件",\n'
+                '  "speech": null,\n'
+                '  "expression": "角色表情描述",\n'
+                '  "dialogue_pending": null\n'
+                "}"
+            )
 
         # --- 步骤 2：调用 LLM ---
         # temperature=0.8 的设计考量：
@@ -335,28 +418,144 @@ class ActorModule:
         style: str,
         user_input: str,
         history_messages: Optional[List[Dict[str, str]]] = None,
+        event_mode: bool = False,
+        scene_context: Optional[str] = None,  # v1.6.fix 新增
     ) -> Tuple[Dict[str, Any], Optional[str]]:
         """
-        带降级的行为生成。
-
-        history_messages 透传给 generate()，语义与 generate() 一致。
-
-        Returns:
-            (parsed_data, raw_response_or_None)
-            成功时 raw_response 为 LLM 原始 JSON 字符串
-            降级时 raw_response 为 None
+        带降级的行为生成。所有参数透传给 generate()。
         """
         try:
             return self.generate(
                 character_name, personality, emotion,
                 focus_memories, goal, style, user_input,
                 history_messages=history_messages,
+                event_mode=event_mode,
+                scene_context=scene_context,
             )
         except Exception as e:
             logger.warning(
                 "Actor LLM 调用失败，使用降级输出: %s", e
             )
+            if event_mode:
+                return dict(FALLBACK_ACTOR_EVENT_OUTPUT), None
             return dict(FALLBACK_ACTOR_OUTPUT), None
+
+
+# ============================================================================
+# InteractionPipeline：对话管线编排层
+# ============================================================================
+
+# ============================================================================
+# v1.6 B4：人格加权函数（模块级纯函数，无外部依赖）
+# ============================================================================
+
+# 人格维度常量（与 Growth 模块保持一致）
+_PERSONALITY_DIMS = [
+    "courage", "intelligence", "sociability",
+    "empathy", "loyalty", "optimism",
+]
+
+def compute_personality_influence(
+    personality: Dict[str, int],
+    event_type: str = "schedule_action",
+) -> str:
+    """
+    基于角色 6 维人格计算事件处理倾向的自然语言引导。
+
+    核心数学逻辑：
+      1. 6 维人格归一化到 [0, 1]
+      2. 计算 5 种 complete_event 子类型权重：
+         - succeed:  勇气 + 智力（主动解决问题的能力）
+         - exceed:   智力 + 乐观（超额完成的创造力与积极心态）
+         - linger:   (1-勇气) + (1-社交)（犹豫不决/回避倾向）
+         - fail:     (1-智力) + (1-勇气)（认知与行动能力不足）
+         - skip:     (1-忠诚) + (1-同理心)（不在意/不关心）
+      3. 计算 2 个能力偏置：
+         - dialogue_bias:  社交 + 乐观（主动交流倾向）
+         - modify_bias:    智力 − 忠诚（计划修改倾向——聪明但不一定守规矩）
+      4. 归一化后格式化为自然语言引导字符串
+
+    设计考量（为什么是"引导"而非"决策"）：
+      函数不替代 Director——它只提供"倾向建议"。
+      Director 保有最终决策权，可以在 prompt 中覆盖此建议。
+      此设计与双 LLM 管路的核心哲学一致：
+      "概率引导在管道上游提供压缩上下文，LLM 在下游做最终判断。"
+
+    Args:
+        personality: 6 维人格字典，值域 [0, 100]
+        event_type:  事件类型字符串（保留以备未来扩展，当前未使用）
+
+    Returns:
+        自然语言引导文本，可直接注入 Director prompt
+    """
+    if not personality or not isinstance(personality, dict):
+        return "（无足够人格数据用于计算倾向）"
+
+    # --- 步骤 1：提取 6 维人格，缺省值 50 ---
+    dims = {}
+    for dim in _PERSONALITY_DIMS:
+        try:
+            val = float(personality.get(dim, 50))
+        except (ValueError, TypeError):
+            val = 50.0
+        dims[dim] = max(0.0, min(100.0, val))
+
+    # --- 步骤 2：归一化到 [0, 1] ---
+    c = dims["courage"] / 100.0       # 勇气
+    i = dims["intelligence"] / 100.0  # 智力
+    s = dims["sociability"] / 100.0   # 社交
+    e = dims["empathy"] / 100.0       # 同理心
+    l = dims["loyalty"] / 100.0       # 忠诚
+    o = dims["optimism"] / 100.0      # 乐观
+
+    # --- 步骤 3：5 种 complete_event 子类型原始权重 ---
+    raw_weights = {
+        "succeed": (c + i) / 2.0,
+        "exceed":  (i + o) / 2.0,
+        "linger":  ((1.0 - c) + (1.0 - s)) / 2.0,
+        "fail":    ((1.0 - i) + (1.0 - c)) / 2.0,
+        "skip":    ((1.0 - l) + (1.0 - e)) / 2.0,
+    }
+
+    # Softmax 归一化为百分比
+    import math
+    exp_weights = {k: math.exp(v * 3.0) for k, v in raw_weights.items()}
+    total_exp = sum(exp_weights.values())
+    pct_weights = {k: v / total_exp for k, v in exp_weights.items()}
+
+    # --- 步骤 4：2 个能力偏置 ---
+    dialogue_bias_raw = (s + o) / 2.0
+    modify_bias_raw = max(0.0, (i - l))  # 智力高+忠诚低 → 更愿意改计划
+
+    # 偏置映射到自然语言等级
+    def _bias_to_label(val: float) -> str:
+        if val > 0.65:
+            return "高"
+        elif val > 0.35:
+            return "中"
+        else:
+            return "低"
+
+    # --- 步骤 5：格式化为自然语言引导 ---
+    # 找出 top 2 子类型
+    sorted_pcts = sorted(pct_weights.items(), key=lambda x: x[1], reverse=True)
+    top_lines = ", ".join(
+        f"{k}={v*100:.0f}%" for k, v in sorted_pcts
+    )
+
+    lines = [
+        "人格倾向分析（由系统计算，仅作引导参考）：",
+        f"你的性格特征：勇气{dims['courage']:.0f} 智力{dims['intelligence']:.0f} "
+        f"社交{dims['sociability']:.0f} 同理心{dims['empathy']:.0f} "
+        f"忠诚{dims['loyalty']:.0f} 乐观{dims['optimism']:.0f}",
+        f"事件完成倾向：{top_lines}",
+        f"主动对话倾向：{_bias_to_label(dialogue_bias_raw)}",
+        f"修改计划倾向：{_bias_to_label(modify_bias_raw)}",
+        "",
+        "注意：以上仅为统计分析，你仍需根据当前事件的具体内容做出最终判断。",
+    ]
+
+    return "\n".join(lines)
 
 
 # ============================================================================
@@ -405,6 +604,75 @@ class InteractionPipeline:
             return json.loads(raw)
         except (json.JSONDecodeError, TypeError):
             return {}
+
+    @staticmethod
+    def _build_scene_context(character: Any, db: Session) -> str:
+        """
+        v1.6 A1：组装场景结构化上下文文本。
+
+        从数据库读取角色当前所在场景的完整层级路径、相邻场景、最近变化，
+        并格式化为紧凑文本块，供 Director prompt 注入。
+
+        Token 预算控制：
+          - 场景路径最多 6 层（约 200 字）
+          - 相邻场景限 5 条（约 150 字）
+          - 最近变化限 3 条（约 200 字）
+          - 总计约 550 字，在 Director 的 token 预算内安全
+
+        Args:
+            character: 已加载的 Character ORM 对象（避免重复查 DB）
+            db: 数据库会话
+
+        Returns:
+            结构化场景文本块；角色无场景信息时返回空字符串
+        """
+        scene_id = getattr(character, "current_scene_id", None)
+        if not scene_id:
+            return ""
+
+        lines = []
+
+        # 1) 场景完整路径（面包屑导航）
+        try:
+            path = scene_crud.get_scene_path(db, scene_id)
+            if path:
+                path_str = " > ".join(
+                    f"{s.name}({s.scene_type or s.scene_layer})"
+                    for s in path
+                )
+                lines.append(f"当前位置（完整路径）：{path_str}")
+                # 获取最深层实际场景的描述
+                current_scene = path[-1]
+                if current_scene.description:
+                    lines.append(f"当前场景描述：{current_scene.description}")
+        except Exception as e:
+            logger.debug("构建场景路径失败: %s", e)
+
+        # 2) 相邻已知场景（兄弟节点）
+        try:
+            adjacent = scene_crud.get_adjacent_scenes(db, scene_id)
+            if adjacent:
+                adj_names = ", ".join(
+                    f"{s.name}({s.scene_type or 'location'})"
+                    for s in adjacent[:5]
+                )
+                lines.append(f"相邻已知场所：{adj_names}")
+        except Exception as e:
+            logger.debug("获取相邻场景失败: %s", e)
+
+        # 3) 最近场景变化
+        try:
+            changes = scene_change_crud.get_recent_changes(db, scene_id, limit=3)
+            if changes:
+                change_lines = [
+                    f"  · Day {ch.day_number}: {ch.description}"
+                    for ch in changes
+                ]
+                lines.append("最近场景变化：\n" + "\n".join(change_lines))
+        except Exception as e:
+            logger.debug("获取场景变化失败: %s", e)
+
+        return "\n".join(lines) if lines else ""
 
     @staticmethod
     def _build_history_messages(
@@ -565,6 +833,9 @@ class InteractionPipeline:
                 )
 
         # ---- 节点 3：执行 Director 注意力聚焦 ----
+        # v1.6 A1：构建场景上下文并注入
+        scene_context = self._build_scene_context(character, db)
+
         # 使用带降级的版本，确保 LLM 失败时管线不崩溃
         director_data, director_raw = self.director.analyze_with_fallback(
             character_name=character.name,
@@ -573,10 +844,11 @@ class InteractionPipeline:
             recent_memories=memory_texts,
             user_input=user_message,
             history_messages=history_messages or None,
+            scene_context=scene_context or None,
         )
 
         # ---- 节点 4：执行 Actor 行为生成 ----
-        # Actor 接收 Director 的完整输出作为上下文
+        # Actor 接收 Director 的完整输出 + 场景上下文
         actor_data, actor_raw = self.actor.generate_with_fallback(
             character_name=character.name,
             personality=personality,
@@ -586,6 +858,7 @@ class InteractionPipeline:
             style=director_data["style"],
             user_input=user_message,
             history_messages=history_messages or None,
+            scene_context=scene_context or None,  # v1.6.fix
         )
 
         # ---- 节点 5：持久化对话记录（带 session_id） ----
@@ -619,4 +892,172 @@ class InteractionPipeline:
             "timestamp": conversation.timestamp,
             "session_id": session_id,
             "session_title": session_title,
+        }
+
+    # =========================================================================
+    # v1.6 B1：事件处理入口 — run_event()
+    # =========================================================================
+
+    @staticmethod
+    def _format_today_schedule(character_id: int, day_number: int, db: Session) -> str:
+        """
+        格式化今日全部日程为人类可读文本（含状态标记）。
+
+        用于事件模式 Director prompt 注入，让 LLM 了解当前事件在整个日程中的位置。
+
+        设计考量：
+          - 标记当前事件为 [← 当前处理中] 帮助 Director 定位
+          - 显示已完成/待处理状态，让 Director 感知当天进度
+          - 同一事件可能有不同 agent（schedule_action 标记为"日程"等）
+        """
+        events = event_crud.get_events_by_day(db, character_id, day_number)
+        if not events:
+            return "  （今日无安排）"
+
+        lines = []
+        for ev in events:
+            period = f" [{ev.time_period}]" if getattr(ev, "time_period", None) else ""
+            status_mark = ""
+            if getattr(ev, "status", "") == "completed":
+                status_mark = " ✅"
+            elif getattr(ev, "status", "") == "pending":
+                status_mark = " ⏳"
+            lines.append(
+                f"  #{ev.order_index}{period} {ev.event_type}{status_mark}: {ev.content}"
+            )
+        return "\n".join(lines)
+
+    def run_event(
+        self,
+        event: Any,           # Event ORM 对象
+        character: Any,       # Character ORM 对象（避免重复查 DB）
+        db: Session,
+    ) -> Dict[str, Any]:
+        """
+        v1.6 B1：事件处理入口 — 将日程事件纳入 Director+Actor 双 LLM 管线。
+
+        核心流程（8 步）：
+          1. 计算人格加权引导 → compute_personality_influence()
+          2. 读取 Scene 上下文 → _build_scene_context()
+          3. 读取今日全部日程 → _format_today_schedule()
+          4. 组装 Director 事件模式 prompt
+          5. Director.analyze(event_mode=True) → emotion/goal/capabilities/attitude
+          6. Actor.generate(event_mode=True) → action/speech/expression/dialogue_pending
+          7. 校验事件模式输出
+          8. 返回 pipeline_result（含 capabilities_applied）
+
+        设计考量：
+          - 复用现有 DirectorModule/ActorModule 实例，仅 prompt 参数不同
+          - 能力集白名单在 Director prompt 中定义，校验在 llm_service 中
+          - plan_modifications 不在此处持久化，返回给调用方（main.py）处理
+
+        Args:
+            event:     待处理的 Event ORM 对象（必须 status=pending）
+            character: 已加载的 Character ORM 对象
+            db:        SQLAlchemy 数据库会话
+
+        Returns:
+            {
+                "action": str,              # Actor 行为叙事
+                "speech": Optional[str],    # Actor 语言（可能为 None）
+                "expression": str,          # Actor 表情
+                "emotion": str,             # Director 情绪
+                "goal": str,                # Director 当前目标
+                "capabilities": list,       # Director 选择的能力列表
+                "event_attitude": str,      # Director 对事件的态度
+                "plan_modifications": list, # Director 的日程/目标修改计划
+                "dialogue_pending": dict|None,  # Actor 待处理对话
+                "director_raw": str|None,   # Director LLM 原始响应
+                "actor_raw": str|None,      # Actor LLM 原始响应
+            }
+        """
+        # ---- 步骤 1：计算人格加权引导（B4） ----
+        personality = self._safe_load_json(character.personality)
+        event_type = getattr(event, "event_type", "schedule_action") or "schedule_action"
+        personality_influence = compute_personality_influence(
+            personality, event_type
+        )
+
+        # ---- 步骤 2：读取 Scene 上下文（A1） ----
+        scene_context = self._build_scene_context(character, db)
+
+        # ---- 步骤 3：读取今日全部日程 ----
+        day_number = getattr(event, "day_number", getattr(character, "day_number", 1)) or 1
+        today_full_schedule = self._format_today_schedule(
+            getattr(character, "id", 0), day_number, db
+        )
+
+        # ---- 步骤 4：组装 Director 事件模式 context ----
+        event_context = {
+            "today_full_schedule": today_full_schedule,
+            "event_type": event_type,
+            "event_content": getattr(event, "content", "") or "",
+            "personality_influence": personality_influence,
+        }
+
+        # ---- 步骤 5：Director 事件模式分析 ----
+        # 使用"事件内容"作为 user_input，让 Director 聚焦于这个具体事件
+        event_description = (
+            f"[{event_type}] {getattr(event, 'content', '未知事件')}"
+        )
+
+        director_data, director_raw = self.director.analyze_with_fallback(
+            character_name=getattr(character, "name", "角色"),
+            personality=personality,
+            current_state=self._safe_load_json(
+                getattr(character, "current_state", None)
+            ),
+            recent_memories=[],  # 事件模式暂不注入记忆（避免 token 超预算）
+            user_input=event_description,
+            scene_context=scene_context or None,
+            event_mode=True,
+            event_context=event_context,
+        )
+
+        # 事件模式 style 字段被 capabilities+event_attitude 替代，按降级值处理
+        style_value = director_data.get("style", "自然的")
+        capabilities = director_data.get("capabilities", ["respond_normally", "complete_event(succeed)"])
+        event_attitude = director_data.get("event_attitude", "平常心对待此事件")
+        plan_modifications = director_data.get("plan_modifications", [])
+
+        # 确保 capabilities 和 plan_modifications 是列表
+        if not isinstance(capabilities, list):
+            capabilities = ["respond_normally", "complete_event(succeed)"]
+        if not isinstance(plan_modifications, list):
+            plan_modifications = []
+
+        # ---- 步骤 6：Actor 事件模式行为生成 ----
+        actor_data, actor_raw = self.actor.generate_with_fallback(
+            character_name=getattr(character, "name", "角色"),
+            personality=personality,
+            emotion=director_data.get("emotion", "平静"),
+            focus_memories=director_data.get("focus_memories", []),
+            goal=director_data.get("goal", "完成当前事件"),
+            style=style_value,
+            user_input=event_description,
+            event_mode=True,
+            scene_context=scene_context or None,  # v1.6.fix
+        )
+
+        # ---- 步骤 7：校验事件模式输出 ----
+        # 使用 LLMService 的专用校验函数
+        capabilities = LLMService.validate_event_capabilities(capabilities)
+        action = actor_data.get("action", "处理了当前事件")
+        speech = actor_data.get("speech")
+        expression = actor_data.get("expression", "表情平静")
+        dialogue_pending = actor_data.get("dialogue_pending")
+
+        # ---- 步骤 8：返回 pipeline_result ----
+        return {
+            "action": action,
+            "speech": speech,  # 可能为 None（无对话对象时）
+            "expression": expression,
+            "emotion": director_data.get("emotion", "平静"),
+            "goal": director_data.get("goal", "完成当前事件"),
+            "capabilities": capabilities,
+            "event_attitude": event_attitude,
+            "plan_modifications": plan_modifications,
+            "dialogue_pending": dialogue_pending,
+            "director_raw": director_raw,
+            "actor_raw": actor_raw,
         }
